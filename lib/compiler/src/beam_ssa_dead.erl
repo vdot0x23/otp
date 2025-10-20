@@ -58,6 +58,7 @@
       Block :: beam_ssa:b_blk().
 
 opt(Linear0) ->
+    file:write_file("linear", term_to_binary(Linear0)),
     {Used,Skippable} = used_vars(Linear0),
     Blocks0 = maps:from_list(Linear0),
     St0 = #st{bs=Blocks0,us=Used,skippable=Skippable},
@@ -1200,11 +1201,17 @@ lit_type(Val) ->
 
 opt_redundant_tests(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
+    %% Reachable blocks?
+    io:format("Blocks 1: ~p~n", [Blocks]),
     RPO = beam_ssa:rpo(Blocks),
+    io:format("RPO: ~p~n", [RPO]),
     Linear = opt_redundant_tests(RPO, Blocks, All),
     beam_ssa:trim_unreachable(Linear).
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
+    io:format("L|Ls: ~p~n", [[L|Ls]]),
+    io:format("Blocks 2: ~p~n", [Blocks]),
+    io:format("All0: ~p~n", [All0]),
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
