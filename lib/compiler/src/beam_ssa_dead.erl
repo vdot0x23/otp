@@ -63,8 +63,10 @@ opt(Linear0) ->
     St0 = #st{bs=Blocks0,us=Used,skippable=Skippable},
     St = shortcut_opt(St0),
     #st{bs=Blocks1} = combine_eqs(St#st{us=#{}}),
-    Blocks = shortcut_failed_succeeded(Blocks1),
-    opt_redundant_tests(Blocks).
+    Blocks2 = shortcut_failed_succeeded(Blocks1),
+    Linear1 = opt_redundant_tests(Blocks2),
+    Blocks = maps:from_list(Linear1),
+    opt_test_traversals(Blocks).
 
 %%%
 %%% Shortcut br/switch targets.
@@ -1134,7 +1136,6 @@ lit_type(Val) ->
         true -> none
     end.
 
-
 %%%
 %%% Remove redundant tests.
 %%%
@@ -1206,6 +1207,219 @@ opt_redundant_tests(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
     Linear = opt_redundant_tests(RPO, Blocks, All),
     beam_ssa:trim_unreachable(Linear).
+
+%%%
+%%% Replace consecutive tests with a call to erts_internal:cmp_term
+%%% and reuse the result from that call.
+%%%
+%%% Consecutive tests such as:
+%%%
+%%%     case L of
+%%%	       [] -> ...;
+%%%	       [Z] when Y < Z -> ...;
+%%%	       [Z] when Z > Y -> ...;
+%%%        ...
+%%%
+%%% If Y and Z are datastructures such as gb_trees or lists,
+%%% they are traversed repeatedly.
+%%% This sub pass rewrites consecutive tests to traverse datastructures only once.
+%%% For example, it may rewrite from:
+%%%
+%%%     _34 = bif:'==' _2, _16  %% We call this a parent
+%%%     br _34, ^34, ^33
+%%%     ...
+%%%     _36 = bif:'<' _2, _16  %% We call this a retraversal
+%%%     br _36, ^36, ^32
+%%%
+%%% To:
+%%%
+%%%     _34 = call (`erts_internal`:`cmp_term`/2), _2, _16
+%%%     switch _34, ^32, [
+%%%       { `-1`, ^32 },
+%%%       { `0`, ^36 },
+%%%       { `-1`, ^32 },
+%%%     ]
+%%%     ...
+%%%     switch _34, ^32, [
+%%%       { `-1`, ^36 },
+%%%       { `0`, ^32 },
+%%%       { `-1`, ^32 },
+%%%     ]
+%%%
+%%% Which in this case is optimized by later passes into a single switch:
+%%%
+%%%    switch _34, ^32, [
+%%%          { `-1`, ^36 },
+%%%          { `0`, ^34 }
+%%%        ]
+%%%
+%%%
+%%% This optimization is only applied when the previously boolean variables
+%%% are single-use in br. In principle all uses of the previously boolean
+%%% variables could be adjusted to handle -1, 0, 1 (from erts_cmp) but
+%%% for the time being they are not.
+%%% Additionally, the parent must dominate the retraversal
+%%% (i.e. erts_internal:cmp_term must have been executed to reuse its result).
+%%%
+opt_test_traversals(Blocks0) ->
+    RPO = beam_ssa:rpo(Blocks0),
+    Uses = beam_ssa:uses(RPO, Blocks0),
+    {Doms, _} = beam_ssa:dominators(RPO, Blocks0),
+    DomTree = build_dominator_tree(maps:values(Doms)),
+    Blocks = opt_test_traversals(DomTree, Blocks0, Uses),
+    Linear = beam_ssa:linearize(Blocks),
+    beam_ssa:trim_unreachable(Linear).
+
+build_dominator_tree(Paths) ->
+    foldl(fun (Path, Acc) -> insert_dominator_node(reverse(Path), Acc) end, #{}, Paths).
+
+insert_dominator_node([], Tree) ->
+    Tree;
+insert_dominator_node([Node | Rest], Tree) ->
+    Children = maps:get(Node, Tree, #{}),
+    SubTree = insert_dominator_node(Rest, Children),
+    Tree#{Node => SubTree}.
+
+opt_test_traversals(DomTree, Blocks0, Uses) ->
+    {_, Blocks} = opt_test_traversals(DomTree, Uses, none, {#{}, Blocks0}),
+    Blocks.
+opt_test_traversals(DomTree, Uses, Parent, State0) ->
+    maps:fold(
+      fun(Node, Children, State1) ->
+              State = opt_test_traversals_block(Node, Parent, Uses, State1),
+              opt_test_traversals(Children, Uses, Node, State)
+      end,
+      State0,
+      DomTree).
+    
+opt_test_traversals_block(Node, Parent, Uses, {DomTests, Blocks}) ->
+    Block = maps:get(Node, Blocks),
+    #b_blk{is=Is} = Block,
+    CandidateTest = opt_test_traversals_is(Is, []),
+    % TODO VIB: consider making node not exist instead of #{}
+    ParentInfoByVars = maps:get(Parent, DomTests, #{}),
+    opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, DomTests).
+
+opt_test_traversal(none, ParentInfoByVars, Node, _Uses, Blocks, DomTests) -> 
+    {DomTests#{Node => ParentInfoByVars}, Blocks};
+opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks0, Acc0) ->
+    {Dst, {CanonicalOp, Var1, Var2}, MustInvert} = CandidateTest,
+    Pack = fun(X, Y) -> {Acc0#{Node => X}, Y} end,
+    InfoByVars = #{{Var1, Var2} => #{dst => Dst, node => Node, mustinvert => MustInvert, op => CanonicalOp}},
+    case ParentInfoByVars of 
+        #{{Var1, Var2} := ParentInfo} ->
+            #{dst := ParentDst, node := ParentL} = ParentInfo,
+            ParentSingleUse = var_single_use(ParentDst, Uses),
+            SingleUse = var_single_use(Dst, Uses),
+            case {ParentSingleUse, SingleUse} of
+                % apply optimization
+                {true, true} -> 
+                    % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
+                    Blocks = case Blocks0 of
+                                 #{Node := Block0} ->
+                                     case change_retraversal(Block0, ParentDst, CanonicalOp, MustInvert) of
+                                         {changed, Block} ->
+                                             io:format("APPLYING~n"),
+                                             Blocks1 = Blocks0#{Node := Block},
+                                             maps:update_with(
+                                               ParentL,
+                                               fun(V) ->
+                                                       change_parent(V, ParentInfo, Var1, Var2)
+                                               end,
+                                               Blocks1);
+                                         {unchanged, _} ->
+                                             % no need to update parent if retraversal not updated
+                                             io:format("NOTAPPLYING~n"),
+                                             Blocks0
+                                     end
+                             end,
+                    % this parent might be a parent for yet another retraversal
+                    Pack(ParentInfoByVars, Blocks);
+                % this parent might be a parent for another retraversal
+                {true, false} -> Pack(ParentInfoByVars, Blocks0);
+                % this retraversal might be a parent for another retraversal
+                {false, true} -> Pack(InfoByVars, Blocks0);
+                % neither parent nor retraversal can be optimized
+                {false, false} -> Pack(#{}, Blocks0)
+            end;
+        _ ->
+            % TODO VIB: maybe throw on duplicate keys, should never happen
+            Pack(maps:merge(InfoByVars, ParentInfoByVars), Blocks0)
+    end.
+
+change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, ParentInfo, Var1, Var2) ->
+    #{mustinvert := MustInvert, op := CanonicalOp} = ParentInfo,
+    % TODO VIB: revisit whether changed/unchanged should matter here
+    {_, Blk1} = change_retraversal(Blk0, BrVar, CanonicalOp, MustInvert),
+    #b_blk{is=Is1} = Blk1,
+    % always the last ins since opt_test_traversals_is only matches the last ins
+    [I0 | Rest] = reverse(Is1),
+    %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
+    I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
+    Done = reverse(Rest, [I]),
+    After = Blk1#b_blk{is=Done},
+    After;
+change_parent(#b_blk{} = Blk0, _, _, _) ->
+    % most common case (from diffable) is an already changed parent, so b_switch
+    Blk0.
+
+change_retraversal(#b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0, ParentVar, CanonicalOp, MustInvert) ->
+    Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
+    {changed, Blk0#b_blk{last=Sw}};
+change_retraversal(#b_blk{} = Blk0, _ParentVar, _CanonicalOp, _MustInvert) ->
+    % a case (from diffable) that probably could be optimizaed is 
+    % {b_ret,#{result_type => {t_atom,[false,true]}},{b_var,11}}}
+    % TODO VIB: I can probably cover this case in the optimization (by replacing the prev b_set)
+    {unchanged, Blk0}.
+
+ 
+% TODO VIB: does this just find the first test? Can't there be multiple tests?
+% TODO VIB: this only looks at the last b_set in the ins list, is that correct / good enough?
+opt_test_traversals_is([#b_set{op=Op,args=Args,dst=Dst}], _Acc) ->
+    case arith_test(Op, Args) of
+        none ->
+            none;
+        {Test, MustInvert} ->
+            {Dst, Test, MustInvert}
+    end;
+opt_test_traversals_is([I|Is], Acc) ->
+   opt_test_traversals_is(Is, [I|Acc]);
+opt_test_traversals_is([], _Acc) -> none.
+
+
+var_single_use(Var, Uses) ->
+    case Uses of
+        #{Var:=[_]} -> true;
+        #{Var:=[_|_]} -> false
+    end.
+
+% Assumes -1,0,1 so no need to know anything about parent/retraversal
+create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) when is_boolean(MustInvert) ->
+    Succ0 = case CanonicalOp of
+        '<' -> [-1];
+        '=<' -> [-1, 0];
+        '==' -> [0]
+    end,
+    Fail0 = [-1,0,1] -- Succ0,
+    {Fail,Succ} = case MustInvert of
+        true -> {Succ0,Fail0};
+        false -> {Fail0,Succ0}
+    end,
+    SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
+    FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
+    SwTable = lists:merge(SuccTable, FailTable),
+    beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
+
+arith_test(Op, Args) ->
+    CanonicalTest = canonical_test(Op, Args),
+    case CanonicalTest of
+        {{'==', _, _}, _} -> CanonicalTest;
+        {{'=<', _, _}, _} -> CanonicalTest;
+        {{'<', _, _}, _} -> CanonicalTest;
+        {{'=:=', _, _}, _} -> none;
+        %%% only tests with two vars are considered
+        _ -> none
+    end.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of

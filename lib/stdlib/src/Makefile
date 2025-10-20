@@ -109,6 +109,7 @@ MODULES= \
 	maps \
 	math \
 	ms_transform \
+	mycmp \
 	otp_internal \
 	orddict \
 	ordsets \
