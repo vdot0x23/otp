@@ -1199,19 +1199,130 @@ lit_type(Val) ->
 %%%     end
 %%%
 
+% Blocks is #{0 => {b_blk ...
 opt_redundant_tests(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
-    %% Reachable blocks?
+    %% Reachable blocks? Maybe, but definitely unordered
     io:format("Blocks 1: ~p~n", [Blocks]),
+
+    % [1,2, ...
     RPO = beam_ssa:rpo(Blocks),
     io:format("RPO: ~p~n", [RPO]),
-    Linear = opt_redundant_tests(RPO, Blocks, All),
-    beam_ssa:trim_unreachable(Linear).
 
-opt_redundant_tests([L|Ls], Blocks, All0) ->
+    % [{ ..
+    Linear = opt_redundant_tests(RPO, Blocks, All),
+
+    io:format("Linear: ~p~n", [Linear]),
+
+    % [{ ..
+    Trimmed = beam_ssa:trim_unreachable(Linear),
+
+    io:format("Trimmed: ~p~n", [Trimmed]),
+    % Map from parent instruction, at least {TargetVar, Var1, Var2} but also canonical rep, to ?
+    % Map of all test instructions, {TargetVar, Var1, Var2}?
+    % I would like to call with Trimmed here I guess but mean Prel becomes []
+    % What is the difference between RPO and Trimmed? :o
+    % Ah! RPO is just the ordered labels whereas the blocks are the blocks
+    % maps:from_list is the secret See caller of this function
+    Blocks2 = maps:from_list(Trimmed),
+    % Money!
+    Prel = prel(RPO, Blocks2, All),
+    io:format("Prel: ~p~n", [Prel]),
+    % For 2nd pass we need:
+    %   Am I parent? -> insert erts_cmp
+    %   Am I a retraversal? -> reuse var from parent
+    %
+    %   Am I a test?
+    %     and not in retraversal map -> I am a parent, bah, incorrect. I need at least one to also use my vars.
+    %     and in retraversal map? -> I am retraversal
+    %     How about mapping like this?:
+    %     {Var1, Var2} -> {TargetVar, CanonicalStuff}
+    %     Problem! I need to characterize instructions by TargetVar, no?
+    %     And where do I find parent's TargetVar?
+    %
+    %     How about mapping like this?:
+    %     {new_test, Var1, Var2} -> {TargetVar, CanonicalStuff}
+    %     {retraversal, Var1, Var2} -> {TargetVar, CanonicalStuff}
+    %
+    %     Am I parent?
+    %       lookup my own {Var1, Var2} in new_test map and in retraversal map
+    %       if present in both -> parent
+    %       if present in retraversal -> retraversal
+    %       if present in parent -> new_test
+    %       if present in neither -> none
+    %
+    %     Seems like that would work :D
+    %
+    %     Can this also be pr. basic block?
+    %     I guess yeah why not
+    %
+    %     Produce list recursively and use maps:from_list to make map, list should be:
+    %     [
+    %       {{new_test, Var1, Var2}, {TargetVar, CanonicalStuff}},
+    %       {{retraversal, Var1, Var2}, {TargetVar, CanonicalStuff}},
+    %       ...
+    %     ]
+    %
+    %
+    %
+    Trimmed.
+
+prel([L|Ls], Blocks, All0) ->
     io:format("L|Ls: ~p~n", [[L|Ls]]),
     io:format("Blocks 2: ~p~n", [Blocks]),
     io:format("All0: ~p~n", [All0]),
+    case All0 of
+        #{L := Tests} ->
+            Blk0 = map_get(L, Blocks),
+            Tests = map_get(L, All0),
+            Blk1 = opt_switch(Blk0, Tests),
+            #b_blk{is=Is0} = Blk1,
+            case opt_redundant_tests_is(Is0, Tests, []) of
+                none ->
+                    All = update_successors(Blk1, Tests, All0),
+                    [{L,Blk1,heho}|prel(Ls, Blocks, All)];
+                {new_test,Bool,Test,MustInvert} ->
+                    All = update_successors(Blk1, Bool, Test, MustInvert,
+                                            Tests, All0),
+                    case Test of
+                        {_, Var1, Var2} -> [{new_test, Var1, Var2}|prel(Ls, Blocks, All)];
+                        _ ->  [{none, none}|prel(Ls, Blocks, All)]
+                    end;
+                {old_test,Is,BoolVar,BoolValue} ->
+                    Blk = case Blk1 of
+                              #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
+                                  Br = beam_ssa:normalize(Br0#b_br{bool=BoolValue}),
+                                  Blk1#b_blk{is=Is,last=Br};
+                              #b_blk{}=Blk2 ->
+                                  Blk2#b_blk{is=Is}
+                          end,
+                    All = update_successors(Blk, Tests, All0),
+                    [{L,Blk,abab}|prel(Ls, Blocks, All)]
+            end;
+        #{} ->
+            prel(Ls, Blocks, All0)
+    end;
+prel([], _Blocks, _All) -> [].
+
+%retraversal(Test, Tests) ->
+%    case Test of
+%        {_, Var1, Var2} ->
+%            case Tests of
+%                %% do not match self
+%                #{Test := _} -> false;
+%                %% not sure if this is exhaustive nor correct, e.g. =:= not included for now
+%                %% TODO VIB: Would be excellent to know which basic block it came from here to avoid scanning all predecessors
+%                %% Maybe even the index in the list
+%                #{{'==', Var1, Var2} := _} -> {true, Var1, Var2};
+%                #{{'=<', Var1, Var2} := _} -> {true, Var1, Var2};
+%                #{{'<', Var1, Var2} := _} -> {true, Var1, Var2};
+%                _ -> false
+%            end;
+%        %% not all tests have two vars
+%        _ -> false
+%    end.
+
+opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
