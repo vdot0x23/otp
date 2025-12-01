@@ -1225,9 +1225,11 @@ opt_redundant_tests(Blocks) ->
     % Ah! RPO is just the ordered labels whereas the blocks are the blocks
     % maps:from_list is the secret See caller of this function
     Blocks2 = maps:from_list(Trimmed),
+    RPO2 = beam_ssa:rpo(Blocks2),
     % Money!
-    Prel = prel(RPO, Blocks2, All),
+    Prel = prel(RPO2, Blocks2, All),
     io:format("Prel: ~p~n", [Prel]),
+    io:format("Prel maps:from_list: ~p~n", [maps:from_list(Prel)]),
     % For 2nd pass we need:
     %   Am I parent? -> insert erts_cmp
     %   Am I a retraversal? -> reuse var from parent
@@ -1263,11 +1265,52 @@ opt_redundant_tests(Blocks) ->
     %       ...
     %     ]
     %
+    %     How to identify multiple retraversals? Do I even need to?
+    %     In case I (an instruction) is a 2nd traversal I need to do the same as the 1st traversal
+    %     (use the TargetVar of new_test, yeah?)
+    %
+    %     TODO: next up, lets traverse instructions and just print something when something should be done
+    %     (we worry about how to do that later, because I wonder how to br on something returned by erts_cmp)
+    %     Lets find a neat(er) way to traverse
+    %       - Here in beam_ssa_dead the most popular ways seems to be over basic blocks first (in RPO), the insns. In beam_ssa_opt there are some more compact examples of this.
+    %       - beam_ssa:fold_blocks could be interesting, but fold like reduce yeah?
+    %         Not sure how much sense that makes when building an entire list of insns again
     %
     %
+    Trav = trav(RPO2, Blocks2),
+    io:format("Trav: ~p~n", [Trav]),
     Trimmed.
 
+%% Identity traversal for reference
+trav([L|Ls], Blocks) ->
+    Blk0 = map_get(L, Blocks),
+    #b_blk{is=Is0} = Blk0,
+    io:format("Trav Is0: ~p~n", [Is0]),
+
+    trav_is(Is0, []),
+
+    [{L, Blk0}|trav(Ls, Blocks)];
+trav([], _Blocks) -> [].
+
+trav_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Acc) ->
+    % TODO
+    io:format("trav_is Op: ~p~n", [Op]),
+    io:format("trav_is Args: ~p~n", [Args]),
+    io:format("trav_is Bool: ~p~n", [Bool]),
+    io:format("trav_is I0: ~p~n", [I0]),
+    io:format("trav_is Acc: ~p~n", [Acc]),
+    none;
+trav_is([I|Is], Acc) ->
+    trav_is(Is, [I|Acc]);
+trav_is([], _Acc) -> none.
+
+
+
+not_interesting(Was) ->
+    {{none,noVar,noVar},{Was}}.
+
 prel([L|Ls], Blocks, All0) ->
+    io:format("prel"),
     io:format("L|Ls: ~p~n", [[L|Ls]]),
     io:format("Blocks 2: ~p~n", [Blocks]),
     io:format("All0: ~p~n", [All0]),
@@ -1277,17 +1320,19 @@ prel([L|Ls], Blocks, All0) ->
             Tests = map_get(L, All0),
             Blk1 = opt_switch(Blk0, Tests),
             #b_blk{is=Is0} = Blk1,
-            case opt_redundant_tests_is(Is0, Tests, []) of
+            case prel_is(Is0, Tests, []) of
                 none ->
                     All = update_successors(Blk1, Tests, All0),
-                    [{L,Blk1,heho}|prel(Ls, Blocks, All)];
+                    [not_interesting(was_none)|prel(Ls, Blocks, All)];
                 {new_test,Bool,Test,MustInvert} ->
                     All = update_successors(Blk1, Bool, Test, MustInvert,
                                             Tests, All0),
                     case Test of
-                        {_, Var1, Var2} -> [{new_test, Var1, Var2}|prel(Ls, Blocks, All)];
-                        _ ->  [{none, none}|prel(Ls, Blocks, All)]
+                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Test}}|prel(Ls, Blocks, All)];
+                        _ ->  [not_interesting(was_new_test)|prel(Ls, Blocks, All)]
                     end;
+                {retraversal, Var1, Var2, Test} ->
+                    [{{retraversal,Var1,Var2},{Test}}|prel(Ls, Blocks, All0)];
                 {old_test,Is,BoolVar,BoolValue} ->
                     Blk = case Blk1 of
                               #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
@@ -1297,30 +1342,71 @@ prel([L|Ls], Blocks, All0) ->
                                   Blk2#b_blk{is=Is}
                           end,
                     All = update_successors(Blk, Tests, All0),
-                    [{L,Blk,abab}|prel(Ls, Blocks, All)]
+                    [not_interesting(old_test)|prel(Ls, Blocks, All)]
             end;
         #{} ->
             prel(Ls, Blocks, All0)
     end;
 prel([], _Blocks, _All) -> [].
 
-%retraversal(Test, Tests) ->
-%    case Test of
-%        {_, Var1, Var2} ->
-%            case Tests of
-%                %% do not match self
-%                #{Test := _} -> false;
-%                %% not sure if this is exhaustive nor correct, e.g. =:= not included for now
-%                %% TODO VIB: Would be excellent to know which basic block it came from here to avoid scanning all predecessors
-%                %% Maybe even the index in the list
-%                #{{'==', Var1, Var2} := _} -> {true, Var1, Var2};
-%                #{{'=<', Var1, Var2} := _} -> {true, Var1, Var2};
-%                #{{'<', Var1, Var2} := _} -> {true, Var1, Var2};
-%                _ -> false
-%            end;
-%        %% not all tests have two vars
-%        _ -> false
-%    end.
+
+prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
+    io:format("prel_is"),
+    case canonical_test(Op, Args) of
+        none ->
+            none;
+        {Test,MustInvert} ->
+            case old_result(Test, Tests) of
+                Result0 when is_boolean(Result0) ->
+                    case gains_type_information(I0) of
+                        false ->
+                            Result = #b_literal{val=Result0 xor MustInvert},
+                            I = I0#b_set{op={bif,'=:='},args=[Result,#b_literal{val=true}]},
+                            {old_test,reverse(Acc, [I]),Bool,Result};
+                        true ->
+                            %% At least one variable will gain type
+                            %% information from this `=:=`
+                            %% operation. Removing it could make it
+                            %% impossible for beam_validator to
+                            %% realize that the code is type-safe.
+                            none
+                    end;
+                none ->
+                    case retraversal(Test, Tests) of 
+                        {true, Var1, Var2, Test} ->
+                            io:format("~p~n", ["retraversal"]),
+                            {retraversal, Var1, Var2, Test};
+                        false ->
+                            {new_test,Bool,Test,MustInvert}
+                    end
+            end
+    end;
+prel_is([I|Is], Tests, Acc) ->
+    prel_is(Is, Tests, [I|Acc]);
+prel_is([], _Tests, _Acc) -> none.
+
+
+
+
+retraversal(Test, Tests) ->
+    io:format("retraversal checking Test: ~p~n", [Test]),
+    io:format("retraversal against Tests: ~p~n", [Tests]),
+    case Test of
+        {_, Var1, Var2} ->
+            case Tests of
+                %% do not match self
+                #{Test := _} -> false;
+                %% not sure if this is exhaustive nor correct, e.g. =:= not included for now
+                %% TODO VIB: Would be excellent to know which basic block it came from here to avoid scanning all predecessors
+                %% Maybe even the index in the list
+                #{{'==', Var1, Var2} := _} -> {true, Var1, Var2, Test};
+                #{{'=<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
+                #{{'<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
+                _ -> false
+            end;
+        %% not all tests have two vars
+        _ -> false
+    end.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of
