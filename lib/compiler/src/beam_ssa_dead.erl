@@ -1247,13 +1247,15 @@ opt_redundant_tests(Blocks) ->
     %     {retraversal, Var1, Var2} -> {TargetVar, CanonicalStuff}
     %
     %     Am I parent?
-    %       lookup my own {Var1, Var2} in new_test map and in retraversal map
+    %       lookup my own {Var1, Var2} in new_test map and in retraversal map NOTE: then new_test map and retraversal map is same map, just w/ different leading atom
     %       if present in both -> parent
     %       if present in retraversal -> retraversal
-    %       if present in parent -> new_test
+    %       if present in new_test -> new_test
     %       if present in neither -> none
     %
     %     Seems like that would work :D
+    %       AH, nevermind - both actual parent and retraversal become parent.
+    %       I need right-hand side, where I can look at test or, better yet, targetvar
     %
     %     Can this also be pr. basic block?
     %     I guess yeah why not
@@ -1264,6 +1266,18 @@ opt_redundant_tests(Blocks) ->
     %       {{retraversal, Var1, Var2}, {TargetVar, CanonicalStuff}},
     %       ...
     %     ]
+    %
+    %     NOTE: targetvar missing
+    %
+    %ptrav_is Prel: #{{new_test,{b_var,0},{b_var,20}} =>
+    %                {{b_var,27},{'<',{b_var,0},{b_var,20}}},
+    %            {new_test,{b_var,2},{b_literal,nil}} =>
+    %                {{b_var,34},{'=:=',{b_var,2},{b_literal,nil}}},
+    %            {new_test,{b_var,31},{b_literal,4}} =>
+    %                {{b_var,32},{'=:=',{b_var,31},{b_literal,4}}},
+    %            {none,noVar,noVar} => {was_none},
+    %            {retraversal,{b_var,0},{b_var,20}} =>
+    %                {{b_var,28},{'=<',{b_var,0},{b_var,20}}}}
     %
     %     How to identify multiple retraversals? Do I even need to?
     %     In case I (an instruction) is a 2nd traversal I need to do the same as the 1st traversal
@@ -1279,7 +1293,79 @@ opt_redundant_tests(Blocks) ->
     %
     Trav = trav(RPO2, Blocks2),
     io:format("Trav: ~p~n", [Trav]),
+    Ptrav = ptrav(RPO2, Blocks2, maps:from_list(Prel)),
+    io:format("Ptrav: ~p~n", [Ptrav]),
     Trimmed.
+
+%% Print traversal
+ptrav([L|Ls], Blocks, Prel) ->
+    Blk0 = map_get(L, Blocks),
+    #b_blk{is=Is0} = Blk0,
+    io:format("ptrav Is0: ~p~n", [Is0]),
+
+    ptrav_is(Is0, [], Prel),
+
+    [{L, Blk0}|ptrav(Ls, Blocks, Prel)];
+ptrav([], _Blocks, _Prel) -> [].
+
+
+lookup_test_vars(Prefix, Test, Prel) ->
+    case Test of
+        {_, Var1, Var2} ->
+            case Prel of
+                #{{Prefix, Var1, Var2} := Value} -> Value;
+                _ -> false
+            end;
+            % not all tests have two variables
+            _ -> false
+    end.
+
+
+something_todo(Op, Args, Prel, Dst) ->
+    case canonical_test(Op, Args) of
+        none ->
+            none;
+        {Test, _MustInvert} ->
+            N = lookup_test_vars(new_test, Test, Prel),
+            R = lookup_test_vars(retraversal, Test, Prel),
+            io:format("something_todo N: ~p~n", [N]),
+            io:format("something_todo R: ~p~n", [R]),
+            case {N, R} of
+                % New test and retraversal later
+                {{Dst, _}, {_, _}} ->
+                    parent;
+                % New test prev. and retraversal now
+                {{_, _}, {Dst, _}} ->
+                    retraversal;
+                % Test variables match, but dst var does not
+                {{_, _}, {_, _}} ->
+                    none;
+                % New test, no retraversal later
+                {{_, _}, false} ->
+                    none;
+                % No match at all, possible for e.g. single variable test
+                {false, false} ->
+                    none
+                % no new test prev. while retraversal later should not be possible
+            end
+    end.
+
+ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
+    % TODO
+    io:format("ptrav_is Op: ~p~n", [Op]),
+    io:format("ptrav_is Args: ~p~n", [Args]),
+    io:format("ptrav_is Dst: ~p~n", [Dst]),
+    io:format("ptrav_is I0: ~p~n", [I0]),
+    io:format("ptrav_is Acc: ~p~n", [Acc]),
+    io:format("ptrav_is Prel: ~p~n", [Prel]),
+    Stodo = something_todo(Op, Args, Prel, Dst),
+    io:format("ptrav_is Stodo: ~p~n", [Stodo]),
+    none;
+ptrav_is([I|Is], Acc, Prel) ->
+    ptrav_is(Is, [I|Acc], Prel);
+ptrav_is([], _Acc, _Prel) -> none.
+
+
 
 %% Identity traversal for reference
 trav([L|Ls], Blocks) ->
@@ -1328,11 +1414,11 @@ prel([L|Ls], Blocks, All0) ->
                     All = update_successors(Blk1, Bool, Test, MustInvert,
                                             Tests, All0),
                     case Test of
-                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Test}}|prel(Ls, Blocks, All)];
+                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All)];
                         _ ->  [not_interesting(was_new_test)|prel(Ls, Blocks, All)]
                     end;
-                {retraversal, Var1, Var2, Test} ->
-                    [{{retraversal,Var1,Var2},{Test}}|prel(Ls, Blocks, All0)];
+                {retraversal, Var1, Var2, Test, Bool} ->
+                    [{{retraversal,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All0)];
                 {old_test,Is,BoolVar,BoolValue} ->
                     Blk = case Blk1 of
                               #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
@@ -1375,7 +1461,7 @@ prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
                     case retraversal(Test, Tests) of 
                         {true, Var1, Var2, Test} ->
                             io:format("~p~n", ["retraversal"]),
-                            {retraversal, Var1, Var2, Test};
+                            {retraversal, Var1, Var2, Test, Bool};
                         false ->
                             {new_test,Bool,Test,MustInvert}
                     end
