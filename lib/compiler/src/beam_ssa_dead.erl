@@ -1283,12 +1283,41 @@ opt_redundant_tests(Blocks) ->
     %     In case I (an instruction) is a 2nd traversal I need to do the same as the 1st traversal
     %     (use the TargetVar of new_test, yeah?)
     %
-    %     TODO: next up, lets traverse instructions and just print something when something should be done
+    %     next up, lets traverse instructions and just print something when something should be done
     %     (we worry about how to do that later, because I wonder how to br on something returned by erts_cmp)
     %     Lets find a neat(er) way to traverse
     %       - Here in beam_ssa_dead the most popular ways seems to be over basic blocks first (in RPO), the insns. In beam_ssa_opt there are some more compact examples of this.
     %       - beam_ssa:fold_blocks could be interesting, but fold like reduce yeah?
     %         Not sure how much sense that makes when building an entire list of insns again
+    %
+    %     DONE.
+    %
+    %     TODO: Now how in the world I manipulate those instructions?
+    %     Lets figure out what the ideal is on paper, yeah?
+    %     Subquestions:
+    %       - can we b_br directly on erts_cmp output?
+    %       - what is b_switch?
+    %
+    %       > The switch instruction is a multi-way branch to one of any number of other blocks, based on the value of a variable. In this example, it branches based on the value of the variable _0. If _0 is equal to 2, execution continues at block 5. If _0 is equal to 1, execution continues at block 4. If the value is not equal to any of the values in the switch list, execution continues at the block referred to by the failure label, in this example block 3.
+    %
+    %       https://www.erlang.org/blog/digging-deeper-in-ssa/
+    %
+    %       Could be useful! Maybe replacing the br with a switch is simpler than comparing on erts_cmp output
+    %
+    %       If I do this I need to make sure all uses of the (now non-bool variable) take the 
+    %       new -1, 0, 1 into consideration instead of a bool
+    %       do I have all uses of it by virtue of??? No :(
+    %
+    %
+    %
+    %       - or, need we apply the test on erts_cmp output?
+    %       - carefully juggle correctness
+    %       - how to insert an entirely new instruction with a new target var?
+    %
+    %
+    %       TODO VIB FOR NOW, just check if its single-use and do the switch thing.
+    %       Maybe single use is common.
+    %
     %
     %
     Trav = trav(RPO2, Blocks2),
@@ -1511,8 +1540,11 @@ opt_redundant_tests([L|Ls], Blocks, All0) ->
                     [{L,Blk1}|opt_redundant_tests(Ls, Blocks, All)];
                 {old_test,Is,BoolVar,BoolValue} ->
                     Blk = case Blk1 of
+                              % match that BoolVar is same
                               #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
+                                  % construction of new
                                   Br = beam_ssa:normalize(Br0#b_br{bool=BoolValue}),
+                                  % use of / return new
                                   Blk1#b_blk{is=Is,last=Br};
                               #b_blk{}=Blk2 ->
                                   Blk2#b_blk{is=Is}
