@@ -1332,9 +1332,31 @@ ptrav([L|Ls], Blocks, Prel) ->
     #b_blk{is=Is0} = Blk0,
     io:format("ptrav Is0: ~p~n", [Is0]),
 
-    ptrav_is(Is0, [], Prel),
-
-    [{L, Blk0}|ptrav(Ls, Blocks, Prel)];
+    case ptrav_is(Is0, [], Prel) of
+        {parent, Is} ->
+            % #b_switch{arg=Arg,fail=Fail,list=[{Lit,Lbl}]}
+            % Blk = case Blk0 of ...
+            % last=switch...
+            % is=Is
+            io:format("modified SSA Blk before: ~p~n", [Blk0]),
+            Blk = case Blk0 of
+                      #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
+                          % Lit(eral) -1, 0, and 1
+                          % TODO VIB: do not assume 1 means SuccLbl
+                          List = [
+                                  {#b_literal{val=-1},FailLbl},
+                                  {#b_literal{val=0},FailLbl},
+                                  {#b_literal{val=1},SuccLbl}
+                                 ],
+                          Sw = beam_ssa:normalize(#b_switch{arg=BrVar,fail=FailLbl,list=List}),
+                          Blk0#b_blk{is=Is,last=Sw};
+                      #b_blk{} -> Blk0
+                  end,
+            io:format("modified SSA Blk after: ~p~n", [Blk]),
+            [{L, Blk}|ptrav(Ls, Blocks, Prel)];
+        none -> 
+            [{L, Blk0}|ptrav(Ls, Blocks, Prel)]
+    end;
 ptrav([], _Blocks, _Prel) -> [].
 
 
@@ -1342,11 +1364,11 @@ lookup_test_vars(Prefix, Test, Prel) ->
     case Test of
         {_, Var1, Var2} ->
             case Prel of
-                #{{Prefix, Var1, Var2} := Value} -> Value;
-                _ -> false
+                #{{Prefix, Var1, Var2} := Value} -> {Value, Var1, Var2};
+                _ -> {false, none, none}
             end;
             % not all tests have two variables
-            _ -> false
+            _ -> {false, none, none}
     end.
 
 
@@ -1355,14 +1377,14 @@ something_todo(Op, Args, Prel, Dst) ->
         none ->
             none;
         {Test, _MustInvert} ->
-            N = lookup_test_vars(new_test, Test, Prel),
-            R = lookup_test_vars(retraversal, Test, Prel),
+            {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, Prel),
+            {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, Prel),
             io:format("something_todo N: ~p~n", [N]),
             io:format("something_todo R: ~p~n", [R]),
             case {N, R} of
                 % New test and retraversal later
                 {{Dst, _}, {_, _}} ->
-                    parent;
+                    {parent, NVar1, NVar2};
                 % New test prev. and retraversal now
                 {{_, _}, {Dst, _}} ->
                     retraversal;
@@ -1389,7 +1411,16 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
     io:format("ptrav_is Prel: ~p~n", [Prel]),
     Stodo = something_todo(Op, Args, Prel, Dst),
     io:format("ptrav_is Stodo: ~p~n", [Stodo]),
-    none;
+    case Stodo of
+        {parent, Var1, Var2} ->
+            I = I0#b_set{op=call,args=['erts_internal:cmp_term', Var1, Var2]},
+            io:format("ptrav_is Stodo parent I: ~p~n", [I]),
+            {parent,reverse(Acc, [I])};
+        retraversal ->
+            none;
+        none ->
+            none
+    end;
 ptrav_is([I|Is], Acc, Prel) ->
     ptrav_is(Is, [I|Acc], Prel);
 ptrav_is([], _Acc, _Prel) -> none.
