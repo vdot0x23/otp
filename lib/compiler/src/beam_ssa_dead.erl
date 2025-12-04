@@ -1333,7 +1333,7 @@ ptrav([L|Ls], Blocks, Prel) ->
     io:format("ptrav Is0: ~p~n", [Is0]),
 
     case ptrav_is(Is0, [], Prel) of
-        {parent, Is} ->
+        {parent, Is, CanonicalOp, MustInvert} ->
             % #b_switch{arg=Arg,fail=Fail,list=[{Lit,Lbl}]}
             % Blk = case Blk0 of ...
             % last=switch...
@@ -1343,12 +1343,29 @@ ptrav([L|Ls], Blocks, Prel) ->
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % Lit(eral) -1, 0, and 1
                           % TODO VIB: do not assume 1 means SuccLbl
-                          List = [
-                                  {#b_literal{val=-1},FailLbl},
-                                  {#b_literal{val=0},FailLbl},
-                                  {#b_literal{val=1},SuccLbl}
-                                 ],
-                          Sw = beam_ssa:normalize(#b_switch{arg=BrVar,fail=FailLbl,list=List}),
+                          
+                          Succ0 = case CanonicalOp of
+                                      '<' -> [-1];
+                                      '=<' -> [-1, 0];
+                                      '=:=' -> [0];
+                                      '==' -> [0]
+                                  end,
+                          Fail0 = [-1,0,1] -- Succ0,
+
+                          {Fail,Succ} = case MustInvert of
+                                            true -> {Succ0,Fail0};
+                                            false -> {Fail0,Succ0}
+                                        end,
+
+
+                          SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
+                          FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
+                          %
+                          % calc fail from success labels
+                          % [-1,0,1] -- [-1]
+
+                          SwTable = lists:merge(SuccTable, FailTable),
+                          Sw = beam_ssa:normalize(#b_switch{arg=BrVar,fail=FailLbl,list=SwTable}),
                           Blk0#b_blk{is=Is,last=Sw};
                       #b_blk{} -> Blk0
                   end,
@@ -1376,7 +1393,7 @@ something_todo(Op, Args, Prel, Dst) ->
     case canonical_test(Op, Args) of
         none ->
             none;
-        {Test, _MustInvert} ->
+        {Test, MustInvert} ->
             {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, Prel),
             {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, Prel),
             io:format("something_todo N: ~p~n", [N]),
@@ -1384,7 +1401,7 @@ something_todo(Op, Args, Prel, Dst) ->
             case {N, R} of
                 % New test and retraversal later
                 {{Dst, _}, {_, _}} ->
-                    {parent, NVar1, NVar2};
+                    {parent, NVar1, NVar2, Test, MustInvert};
                 % New test prev. and retraversal now
                 {{_, _}, {Dst, _}} ->
                     retraversal;
@@ -1412,10 +1429,22 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
     Stodo = something_todo(Op, Args, Prel, Dst),
     io:format("ptrav_is Stodo: ~p~n", [Stodo]),
     case Stodo of
-        {parent, Var1, Var2} ->
+        % TODO VIB: returning both vars and Test is redundant
+        {parent, Var1, Var2, Test, MustInvert} ->
             I = I0#b_set{op=call,args=['erts_internal:cmp_term', Var1, Var2]},
             io:format("ptrav_is Stodo parent I: ~p~n", [I]),
-            {parent,reverse(Acc, [I])};
+
+            % Operation = '<' | '=<' | '=:=' | '=='
+            % calc success conditions
+            {CanonicalOp, _, _} = Test,
+            _Lbls = case CanonicalOp of
+                '<' -> {-1};
+                '=<' -> {-1, 0};
+                '=:=' -> {0};
+                '==' -> {0}
+            end,
+
+            {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
         retraversal ->
             none;
         none ->
