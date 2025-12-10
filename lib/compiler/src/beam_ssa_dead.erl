@@ -1338,11 +1338,10 @@ ptrav([L|Ls], Blocks, Prel) ->
             % Blk = case Blk0 of ...
             % last=switch...
             % is=Is
-            io:format("modified SSA Blk before: ~p~n", [Blk0]),
+            io:format("parent modified SSA Blk before: ~p~n", [Blk0]),
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          % Lit(eral) -1, 0, and 1
-                          % TODO VIB: do not assume 1 means SuccLbl
+                          % TODO VIB: check single-use in br
                           
                           Succ0 = case CanonicalOp of
                                       '<' -> [-1];
@@ -1369,7 +1368,37 @@ ptrav([L|Ls], Blocks, Prel) ->
                           Blk0#b_blk{is=Is,last=Sw};
                       #b_blk{} -> Blk0
                   end,
-            io:format("modified SSA Blk after: ~p~n", [Blk]),
+            io:format("parent modified SSA Blk after: ~p~n", [Blk]),
+            [{L, Blk}|ptrav(Ls, Blocks, Prel)];
+        {retraversal, ParentVar, CanonicalOp, MustInvert} ->
+            io:format("retraversal ParentVar: ~p~n", [ParentVar]),
+            io:format("retraversal modified SSA Blk before: ~p~n", [Blk0]),
+            Blk = case Blk0 of
+                      #b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
+                          % TODO VIB: check single-use in br
+                          Succ0 = case CanonicalOp of
+                                      '<' -> [-1];
+                                      '=<' -> [-1, 0];
+                                      '=:=' -> [0];
+                                      '==' -> [0]
+                                  end,
+                          Fail0 = [-1,0,1] -- Succ0,
+
+                          {Fail,Succ} = case MustInvert of
+                                            true -> {Succ0,Fail0};
+                                            false -> {Fail0,Succ0}
+                                        end,
+
+
+                          SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
+                          FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
+
+                          SwTable = lists:merge(SuccTable, FailTable),
+                          Sw = beam_ssa:normalize(#b_switch{arg=ParentVar,fail=FailLbl,list=SwTable}),
+                          Blk0#b_blk{last=Sw};
+                      #b_blk{} -> Blk0
+                  end,
+            io:format("retraversal modified SSA Blk after: ~p~n", [Blk]),
             [{L, Blk}|ptrav(Ls, Blocks, Prel)];
         none -> 
             [{L, Blk0}|ptrav(Ls, Blocks, Prel)]
@@ -1403,8 +1432,8 @@ something_todo(Op, Args, Prel, Dst) ->
                 {{Dst, _}, {_, _}} ->
                     {parent, NVar1, NVar2, Test, MustInvert};
                 % New test prev. and retraversal now
-                {{_, _}, {Dst, _}} ->
-                    retraversal;
+                {{ParentDst, _}, {Dst, _}} ->
+                    {retraversal, ParentDst, Test, MustInvert};
                 % Test variables match, but dst var does not
                 {{_, _}, {_, _}} ->
                     none;
@@ -1445,8 +1474,9 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
             end,
 
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
-        retraversal ->
-            none;
+        {retraversal, ParentVar, Test, MustInvert} ->
+            {CanonicalOp, _, _} = Test,
+            {retraversal, ParentVar, CanonicalOp, MustInvert};
         none ->
             none
     end;
