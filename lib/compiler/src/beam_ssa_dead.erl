@@ -1203,21 +1203,21 @@ lit_type(Val) ->
 opt_redundant_tests(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     %% Reachable blocks? Maybe, but definitely unordered
-    io:format("Blocks 1: ~p~n", [Blocks]),
+    %io:format("Blocks 1: ~p~n", [Blocks]),
 
     % [1,2, ...
     RPO = beam_ssa:rpo(Blocks),
-    io:format("RPO: ~p~n", [RPO]),
+    %io:format("RPO: ~p~n", [RPO]),
 
     % [{ ..
     Linear = opt_redundant_tests(RPO, Blocks, All),
 
-    io:format("Linear: ~p~n", [Linear]),
+    %io:format("Linear: ~p~n", [Linear]),
 
     % [{ ..
     Trimmed = beam_ssa:trim_unreachable(Linear),
 
-    io:format("Trimmed: ~p~n", [Trimmed]),
+    %io:format("Trimmed: ~p~n", [Trimmed]),
     % Map from parent instruction, at least {TargetVar, Var1, Var2} but also canonical rep, to ?
     % Map of all test instructions, {TargetVar, Var1, Var2}?
     % I would like to call with Trimmed here I guess but mean Prel becomes []
@@ -1228,8 +1228,8 @@ opt_redundant_tests(Blocks) ->
     RPO2 = beam_ssa:rpo(Blocks2),
     % Money!
     Prel = prel(RPO2, Blocks2, All),
-    io:format("Prel: ~p~n", [Prel]),
-    io:format("Prel maps:from_list: ~p~n", [maps:from_list(Prel)]),
+    %io:format("Prel: ~p~n", [Prel]),
+    %io:format("Prel maps:from_list: ~p~n", [maps:from_list(Prel)]),
     % For 2nd pass we need:
     %   Am I parent? -> insert erts_cmp
     %   Am I a retraversal? -> reuse var from parent
@@ -1320,11 +1320,15 @@ opt_redundant_tests(Blocks) ->
     %
     %
     %
-    Trav = trav(RPO2, Blocks2),
-    io:format("Trav: ~p~n", [Trav]),
+    
+    _Trav = trav(RPO2, Blocks2),
+    %io:format("Trav: ~p~n", [Trav]),
+    
     Ptrav = ptrav(RPO2, Blocks2, maps:from_list(Prel), {uses,Trimmed}),
-    io:format("Ptrav: ~p~n", [Ptrav]),
-    Trimmed.
+    %io:format("Ptrav: ~p~n", [Ptrav]),
+    Trimmed2 = beam_ssa:trim_unreachable(Ptrav),
+    io:format("Trimmed2: ~p~n", [Trimmed2]),
+    Trimmed2.
 
 var_single_use(Var, {uses,Linear}) ->
     Blocks = maps:from_list(Linear),
@@ -1341,7 +1345,7 @@ var_single_use(Var, Uses) when is_map(Uses) ->
 ptrav([L|Ls], Blocks, Prel, Uses0) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    io:format("ptrav Is0: ~p~n", [Is0]),
+    %io:format("ptrav Is0: ~p~n", [Is0]),
 
     case ptrav_is(Is0, [], Prel) of
         {parent, Is, CanonicalOp, MustInvert} ->
@@ -1349,7 +1353,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
             % Blk = case Blk0 of ...
             % last=switch...
             % is=Is
-            io:format("parent modified SSA Blk before: ~p~n", [Blk0]),
+            %io:format("parent modified SSA Blk before: ~p~n", [Blk0]),
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % TODO VIB: check single-use in br
@@ -1358,7 +1362,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                           {SingleUse, _} = var_single_use(BrVar, Uses0),
                           case SingleUse of 
                               true ->
-                                  io:format("parent targetvar SingleUse: ~p~n", [SingleUse]),
+                                  %io:format("parent targetvar SingleUse: ~p~n", [SingleUse]),
 
                                   Succ0 = case CanonicalOp of
                                               '<' -> [-1];
@@ -1381,18 +1385,22 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                                   % [-1,0,1] -- [-1]
 
                                   SwTable = lists:merge(SuccTable, FailTable),
-                                  Sw = beam_ssa:normalize(#b_switch{arg=BrVar,fail=FailLbl,list=SwTable}),
+                                  io:format("FailLbl: ~p~n", [FailLbl]),
+                                  Swi = #b_switch{arg=BrVar,fail=FailLbl,list=SwTable},
+                                  io:format("Swi: ~p~n", [Swi]),
+                                  Sw = beam_ssa:normalize(Swi),
+                                  io:format("Sw: ~p~n", [Sw]),
                                   Blk0#b_blk{is=Is,last=Sw};
                               false ->
                                   Blk0
                           end;
                       #b_blk{} -> Blk0
                   end,
-            io:format("parent modified SSA Blk after: ~p~n", [Blk]),
+            %io:format("parent modified SSA Blk after: ~p~n", [Blk]),
             [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses0)];
         {retraversal, ParentVar, CanonicalOp, MustInvert} ->
-            io:format("retraversal ParentVar: ~p~n", [ParentVar]),
-            io:format("retraversal modified SSA Blk before: ~p~n", [Blk0]),
+            %io:format("retraversal ParentVar: ~p~n", [ParentVar]),
+            %io:format("retraversal modified SSA Blk before: ~p~n", [Blk0]),
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % TODO VIB: check single-use in br (note of both BrVar and parent, otherwise change was not applied to parent)
@@ -1400,7 +1408,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                           {SingleUse, _} = var_single_use(BrVar, Uses0),
                           case ParentSingleUse and SingleUse of 
                               true ->
-                                  io:format("retraversal SingleUse: ~p~n", [SingleUse]),
+                                  %io:format("retraversal SingleUse: ~p~n", [SingleUse]),
 
                                   Succ0 = case CanonicalOp of
                                               '<' -> [-1];
@@ -1426,7 +1434,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                           end;
                       #b_blk{} -> Blk0
                   end,
-            io:format("retraversal modified SSA Blk after: ~p~n", [Blk]),
+            %io:format("retraversal modified SSA Blk after: ~p~n", [Blk]),
             [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses0)];
         none -> 
             [{L, Blk0}|ptrav(Ls, Blocks, Prel, Uses0)]
@@ -1453,8 +1461,8 @@ something_todo(Op, Args, Prel, Dst) ->
         {Test, MustInvert} ->
             {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, Prel),
             {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, Prel),
-            io:format("something_todo N: ~p~n", [N]),
-            io:format("something_todo R: ~p~n", [R]),
+            %io:format("something_todo N: ~p~n", [N]),
+            %io:format("something_todo R: ~p~n", [R]),
             case {N, R} of
                 % New test and retraversal later
                 {{Dst, _}, {_, _}} ->
@@ -1477,19 +1485,19 @@ something_todo(Op, Args, Prel, Dst) ->
 
 ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
     % TODO
-    io:format("ptrav_is Op: ~p~n", [Op]),
-    io:format("ptrav_is Args: ~p~n", [Args]),
-    io:format("ptrav_is Dst: ~p~n", [Dst]),
-    io:format("ptrav_is I0: ~p~n", [I0]),
-    io:format("ptrav_is Acc: ~p~n", [Acc]),
-    io:format("ptrav_is Prel: ~p~n", [Prel]),
+    %io:format("ptrav_is Op: ~p~n", [Op]),
+    %io:format("ptrav_is Args: ~p~n", [Args]),
+    %io:format("ptrav_is Dst: ~p~n", [Dst]),
+    %io:format("ptrav_is I0: ~p~n", [I0]),
+    %io:format("ptrav_is Acc: ~p~n", [Acc]),
+    %io:format("ptrav_is Prel: ~p~n", [Prel]),
     Stodo = something_todo(Op, Args, Prel, Dst),
-    io:format("ptrav_is Stodo: ~p~n", [Stodo]),
+    %io:format("ptrav_is Stodo: ~p~n", [Stodo]),
     case Stodo of
         % TODO VIB: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
-            I = I0#b_set{op=call,args=['erts_internal:cmp_term', Var1, Var2]},
-            io:format("ptrav_is Stodo parent I: ~p~n", [I]),
+            I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
+            %io:format("ptrav_is Stodo parent I: ~p~n", [I]),
 
             % Operation = '<' | '=<' | '=:=' | '=='
             % calc success conditions
@@ -1518,20 +1526,20 @@ ptrav_is([], _Acc, _Prel) -> none.
 trav([L|Ls], Blocks) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    io:format("Trav Is0: ~p~n", [Is0]),
+    %io:format("Trav Is0: ~p~n", [Is0]),
 
     trav_is(Is0, []),
 
     [{L, Blk0}|trav(Ls, Blocks)];
 trav([], _Blocks) -> [].
 
-trav_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Acc) ->
+trav_is([#b_set{op=_Op,args=_Args,dst=_Bool}=_I0], _Acc) ->
     % TODO
-    io:format("trav_is Op: ~p~n", [Op]),
-    io:format("trav_is Args: ~p~n", [Args]),
-    io:format("trav_is Bool: ~p~n", [Bool]),
-    io:format("trav_is I0: ~p~n", [I0]),
-    io:format("trav_is Acc: ~p~n", [Acc]),
+    %io:format("trav_is Op: ~p~n", [Op]),
+    %io:format("trav_is Args: ~p~n", [Args]),
+    %io:format("trav_is Bool: ~p~n", [Bool]),
+    %io:format("trav_is I0: ~p~n", [I0]),
+    %io:format("trav_is Acc: ~p~n", [Acc]),
     none;
 trav_is([I|Is], Acc) ->
     trav_is(Is, [I|Acc]);
@@ -1543,10 +1551,10 @@ not_interesting(Was) ->
     {{none,noVar,noVar},{Was}}.
 
 prel([L|Ls], Blocks, All0) ->
-    io:format("prel"),
-    io:format("L|Ls: ~p~n", [[L|Ls]]),
-    io:format("Blocks 2: ~p~n", [Blocks]),
-    io:format("All0: ~p~n", [All0]),
+    %io:format("prel"),
+    %io:format("L|Ls: ~p~n", [[L|Ls]]),
+    %io:format("Blocks 2: ~p~n", [Blocks]),
+    %io:format("All0: ~p~n", [All0]),
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
@@ -1584,7 +1592,7 @@ prel([], _Blocks, _All) -> [].
 
 
 prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
-    io:format("prel_is"),
+    %io:format("prel_is"),
     case canonical_test(Op, Args) of
         none ->
             none;
@@ -1607,7 +1615,7 @@ prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
                 none ->
                     case retraversal(Test, Tests) of 
                         {true, Var1, Var2, Test} ->
-                            io:format("~p~n", ["retraversal"]),
+                            %io:format("~p~n", ["retraversal"]),
                             {retraversal, Var1, Var2, Test, Bool};
                         false ->
                             {new_test,Bool,Test,MustInvert}
@@ -1622,8 +1630,8 @@ prel_is([], _Tests, _Acc) -> none.
 
 
 retraversal(Test, Tests) ->
-    io:format("retraversal checking Test: ~p~n", [Test]),
-    io:format("retraversal against Tests: ~p~n", [Tests]),
+    %io:format("retraversal checking Test: ~p~n", [Test]),
+    %io:format("retraversal against Tests: ~p~n", [Tests]),
     case Test of
         {_, Var1, Var2} ->
             case Tests of
