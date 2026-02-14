@@ -58,7 +58,7 @@
       Block :: beam_ssa:b_blk().
 
 opt(Linear0) ->
-    file:write_file("linear", term_to_binary(Linear0)),
+    %file:write_file("linear", term_to_binary(Linear0)),
     {Used,Skippable} = used_vars(Linear0),
     Blocks0 = maps:from_list(Linear0),
     St0 = #st{bs=Blocks0,us=Used,skippable=Skippable},
