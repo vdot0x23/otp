@@ -460,7 +460,9 @@ join_arg_types(Args, TypeMaps) ->
 
 opt_function(Linear, Args, Id, Ts, FuncDb) ->
     MetaCache = #{},
-    opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache).
+    Opted = opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache),
+    %io:format("opt_function Opted ~p~n", [Opted]),
+    Opted.
 
 -spec opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache) -> Result when
       Linear :: [{non_neg_integer(), beam_ssa:b_blk()}],
@@ -471,6 +473,12 @@ opt_function(Linear, Args, Id, Ts, FuncDb) ->
       Result :: {Linear, FuncDb},
       MetaCache :: meta_cache().
 opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache) ->
+    %io:format("opt_function Linear ~p~n", [Linear]),
+    %io:format("opt_function Args ~p~n", [Args]),
+    %io:format("opt_function Id ~p~n", [Id]),
+    %io:format("opt_function Ts ~p~n", [Ts]),
+    %io:format("opt_function FuncDb ~p~n", [FuncDb]),
+    %io:format("opt_function MetaCache ~p~n", [MetaCache]),
     try
         do_opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache)
     catch
@@ -519,12 +527,18 @@ opt_bs([{L, #b_blk{is=Is0,last=Last0}=Blk0} | Bs],
     case Ls0 of
         #{ L := Incoming } ->
             {incoming, Ts0} = Incoming,         %Assertion.
+            %io:format("opt_bs Ts0: ~p~n", [Ts0]),
 
             {Is, Ts, Ds, Fdb, Sub} =
                 opt_is(Is0, Ts0, Ds0, Ls0, Fdb0, Sub0, Meta, []),
 
+            %OptedIs = {Is, Ts, Ds, Fdb, Sub},
+            %io:format("opt_bs OptedIs: ~p~n", [OptedIs]),
+
             Last1 = simplify_terminator(Last0, Ts, Ds, Sub),
+            %io:format("opt_bs Last1: ~p~n", [Last1]),
             SuccTypes = update_success_types(Last1, Ts, Ds, Meta, SuccTypes0),
+            %io:format("opt_bs SuccTypes: ~p~n", [SuccTypes]),
 
             UsedOnce = Meta#metadata.used_once,
             {Last2, Ls1} = update_successors(Last1, Ts, Ds, Ls0, UsedOnce),
@@ -553,6 +567,7 @@ opt_is([#b_set{op=call,
     {I, Fdb} = opt_local_call(I1, Callee, CallArgs, Dst, Ts0, Fdb0, Meta),
 
     Ts = update_types(I, Ts0, Ds0),
+    %io:format("op_is call b_local Ts: ~p~n", [Ts]),
     Ds = Ds0#{ Dst => I },
     opt_is(Is, Ts, Ds, Ls, Fdb, Sub, Meta, [I | Acc]);
 opt_is([#b_set{op=call,
@@ -566,6 +581,7 @@ opt_is([#b_set{op=call,
     {I, Fdb} = opt_fun_call(I1, Args, Ts0, Ds0, Fdb0, Sub, Meta),
 
     Ts = update_types(I, Ts0, Ds0),
+    %io:format("op_is call b_var Ts: ~p~n", [Ts]),
     Ds = Ds0#{ Dst => I },
     opt_is(Is, Ts, Ds, Ls, Fdb, Sub, Meta, [I | Acc]);
 opt_is([#b_set{op=make_fun,args=Args0,dst=Dst}=I0|Is],
@@ -576,11 +592,14 @@ opt_is([#b_set{op=make_fun,args=Args0,dst=Dst}=I0|Is],
     {I, Fdb} = opt_make_fun(I1, Ts0, Fdb0, Meta),
 
     Ts = update_types(I, Ts0, Ds0),
+    %io:format("op_is make_fun b_var Ts: ~p~n", [Ts]),
     Ds = Ds0#{ Dst => I },
     opt_is(Is, Ts, Ds, Ls, Fdb, Sub0, Meta, [I|Acc]);
 opt_is([I0 | Is], Ts0, Ds0, Ls, Fdb, Sub0, Meta, Acc) ->
     case simplify(I0, Ts0, Ds0, Ls, Sub0) of
         {#b_set{}=I1, Ts, Ds} ->
+            %io:format("op_is ? I1: ~p~n", [I1]),
+            %io:format("op_is ? Ts: ~p~n", [Ts]),
             I = opt_anno_types(I1, Ts),
             opt_is(Is, Ts, Ds, Ls, Fdb, Sub0, Meta, [I | Acc]);
         Sub when is_map(Sub) ->
@@ -971,6 +990,10 @@ simplify_terminator(#b_br{bool=Bool}=Br0, Ts, Ds, Sub) ->
 simplify_terminator(#b_switch{arg=Arg0,fail=Fail,list=List0}=Sw0,
                     Ts, Ds, Sub) ->
     Arg = simplify_arg(Arg0, Ts, Sub),
+    %% NOTE VIB: I guess this makes sense since it removes redundancy,
+    %% just that the other thing does not expect a switch with a single
+    %% thing in its list
+    %%
     %% Ensure that no label in the switch list is the same as the
     %% failure label.
     List = [{Val,Lbl} || {Val,Lbl} <:- List0, Lbl =/= Fail],
@@ -2055,13 +2078,25 @@ update_successors(#b_br{bool=#b_var{}=Bool,succ=Succ,fail=Fail}=Last0,
 update_successors(#b_switch{arg=#b_var{}=V,fail=Fail0,list=List0}=Last0,
                   Ts, Ds, Ls0, UsedOnce) ->
     IsTempVar = is_map_key(V, UsedOnce),
+    %io:format("update_successors Fail0: ~p~n", [Fail0]),
+    %io:format("update_successors List0: ~p~n", [List0]),
+    %io:format("update_successors IsTempVar: ~p~n", [IsTempVar]),
+
+    %io:format("update_successors V: ~p~n", [V]),
+    %io:format("update_successors Ts: ~p~n", [Ts]),
+    %io:format("update_successors concrete_type(V, Ts): ~p~n", [concrete_type(V, Ts)]),
 
     {List1, FailTs, Ls1} =
         update_switch(List0, V, concrete_type(V, Ts),
                       Ts, Ds, Ls0, IsTempVar, []),
 
+    %io:format("update_successors FailTs: ~p~n", [FailTs]),
+    %io:format("update_successors List1: ~p~n", [List1]),
+    %io:format("update_successors Ls1: ~p~n", [Ls1]),
+
     case FailTs of
         none ->
+            %% NOTE VIB: why do we end up here?
             %% The fail block is unreachable; swap it with one of the choices.
             case List1 of
                 [{#b_literal{val=0},_}|_] ->
@@ -2087,7 +2122,10 @@ update_successors(#b_ret{}=Last, _Ts, _Ds, Ls, _UsedOnce) ->
 
 update_switch([{Val, Lbl}=Sw | List],
               V, FailType0, Ts, Ds, Ls0, IsTempVar, Acc) ->
+    %io:format("update_switch FailType0: ~p~n", [FailType0]),
     FailType = beam_types:subtract(FailType0, concrete_type(Val, Ts)),
+    %io:format("update_switch FailType: ~p~n", [FailType]),
+    %io:format("update_switch List: ~p~n", [List]),
     case infer_types_switch(V, Val, Ts, IsTempVar, Ds) of
         none ->
             update_switch(List, V, FailType, Ts, Ds, Ls0, IsTempVar, Acc);

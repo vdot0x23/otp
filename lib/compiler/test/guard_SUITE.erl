@@ -1949,17 +1949,23 @@ generated_combinations(_Config) ->
     Mod = ?FUNCTION_NAME,
     RelOps = ['=:=','=/=','==','/=','<','=<','>=','>'],
     Combinations0 = [{Op1,Op2} || Op1 <- RelOps, Op2 <- RelOps],
+    %% Generate literal combinations?
     Combinations1 = gen_lit_combs(Combinations0),
     Combinations2 = [{neq,Comb} ||
                         {_Op1,_Lit1,Op2,_Lit2}=Comb <- Combinations1,
                         Op2 =:= '=/=' orelse Op2 =:= '/='] ++ Combinations1,
     Combinations = gen_func_names(Combinations2, 0),
+    %% rel(ative/tional) functions?
     Fs = gen_rel_op_functions(Combinations),
+    %% Source tree?
     Tree = ?Q(["-module('@Mod@').",
                "-compile([export_all,nowarn_export_all])."]) ++ Fs,
     %%merl:print(Tree),
+    %% Optimization options?
     Opts = test_lib:opt_opts(?MODULE),
+    %% compile code? and load to where?
     {ok,_Bin} = merl:compile_and_load(Tree, Opts),
+    %% Since the source tree is now loaded into memory, they can be called by name in test_combinations
     test_combinations(Combinations, Mod).
 
 gen_lit_combs([{Op1,Op2}|T]) ->
