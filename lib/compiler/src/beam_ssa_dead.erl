@@ -1327,7 +1327,7 @@ opt_redundant_tests(Blocks) ->
     Ptrav = ptrav(RPO2, Blocks2, maps:from_list(Prel), {uses,Trimmed}),
     %io:format("Ptrav: ~p~n", [Ptrav]),
     Trimmed2 = beam_ssa:trim_unreachable(Ptrav),
-    io:format("Trimmed2: ~p~n", [Trimmed2]),
+    %io:format("Trimmed2: ~p~n", [Trimmed2]),
     Trimmed2.
 
 var_single_use(Var, {uses,Linear}) ->
@@ -1385,11 +1385,11 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                                   % [-1,0,1] -- [-1]
 
                                   SwTable = lists:merge(SuccTable, FailTable),
-                                  io:format("FailLbl: ~p~n", [FailLbl]),
+                                  %io:format("FailLbl: ~p~n", [FailLbl]),
                                   Swi = #b_switch{arg=BrVar,fail=FailLbl,list=SwTable},
-                                  io:format("Swi: ~p~n", [Swi]),
+                                  %io:format("Swi: ~p~n", [Swi]),
                                   Sw = beam_ssa:normalize(Swi),
-                                  io:format("Sw: ~p~n", [Sw]),
+                                  %io:format("Sw: ~p~n", [Sw]),
                                   Blk0#b_blk{is=Is,last=Sw};
                               false ->
                                   Blk0
