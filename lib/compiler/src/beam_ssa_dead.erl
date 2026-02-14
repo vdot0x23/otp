@@ -58,14 +58,15 @@
       Block :: beam_ssa:b_blk().
 
 opt(Linear0) ->
-    %file:write_file("linear", term_to_binary(Linear0)),
     {Used,Skippable} = used_vars(Linear0),
     Blocks0 = maps:from_list(Linear0),
     St0 = #st{bs=Blocks0,us=Used,skippable=Skippable},
     St = shortcut_opt(St0),
     #st{bs=Blocks1} = combine_eqs(St#st{us=#{}}),
-    Blocks = shortcut_failed_succeeded(Blocks1),
-    opt_redundant_tests(Blocks).
+    Blocks2 = shortcut_failed_succeeded(Blocks1),
+    Linear1 = opt_redundant_tests(Blocks2),
+    Blocks = maps:from_list(Linear1),
+    opt_test_traversals(Blocks).
 
 %%%
 %%% Shortcut br/switch targets.
@@ -1132,7 +1133,6 @@ lit_type(Val) ->
         true -> none
     end.
 
-
 %%%
 %%% Remove redundant tests.
 %%%
@@ -1202,139 +1202,19 @@ lit_type(Val) ->
 % Blocks is #{0 => {b_blk ...
 opt_redundant_tests(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
-    %% Reachable blocks? Maybe, but definitely unordered
-    %io:format("Blocks 1: ~p~n", [Blocks]),
-
-    % [1,2, ...
     RPO = beam_ssa:rpo(Blocks),
-    %io:format("RPO: ~p~n", [RPO]),
-
-    % [{ ..
     Linear = opt_redundant_tests(RPO, Blocks, All),
+    beam_ssa:trim_unreachable(Linear).
 
-    %io:format("Linear: ~p~n", [Linear]),
-
-    % [{ ..
-    Trimmed = beam_ssa:trim_unreachable(Linear),
-
-    %io:format("Trimmed: ~p~n", [Trimmed]),
-    % Map from parent instruction, at least {TargetVar, Var1, Var2} but also canonical rep, to ?
-    % Map of all test instructions, {TargetVar, Var1, Var2}?
-    % I would like to call with Trimmed here I guess but mean Prel becomes []
-    % What is the difference between RPO and Trimmed? :o
-    % Ah! RPO is just the ordered labels whereas the blocks are the blocks
-    % maps:from_list is the secret See caller of this function
-    Blocks2 = maps:from_list(Trimmed),
-    RPO2 = beam_ssa:rpo(Blocks2),
-    % Money!
-    Prel = prel(RPO2, Blocks2, All),
-    %io:format("Prel: ~p~n", [Prel]),
-    %io:format("Prel maps:from_list: ~p~n", [maps:from_list(Prel)]),
-    % For 2nd pass we need:
-    %   Am I parent? -> insert erts_cmp
-    %   Am I a retraversal? -> reuse var from parent
-    %
-    %   Am I a test?
-    %     and not in retraversal map -> I am a parent, bah, incorrect. I need at least one to also use my vars.
-    %     and in retraversal map? -> I am retraversal
-    %     How about mapping like this?:
-    %     {Var1, Var2} -> {TargetVar, CanonicalStuff}
-    %     Problem! I need to characterize instructions by TargetVar, no?
-    %     And where do I find parent's TargetVar?
-    %
-    %     How about mapping like this?:
-    %     {new_test, Var1, Var2} -> {TargetVar, CanonicalStuff}
-    %     {retraversal, Var1, Var2} -> {TargetVar, CanonicalStuff}
-    %
-    %     Am I parent?
-    %       lookup my own {Var1, Var2} in new_test map and in retraversal map NOTE: then new_test map and retraversal map is same map, just w/ different leading atom
-    %       if present in both -> parent
-    %       if present in retraversal -> retraversal
-    %       if present in new_test -> new_test
-    %       if present in neither -> none
-    %
-    %     Seems like that would work :D
-    %       AH, nevermind - both actual parent and retraversal become parent.
-    %       I need right-hand side, where I can look at test or, better yet, targetvar
-    %
-    %     Can this also be pr. basic block?
-    %     I guess yeah why not
-    %
-    %     Produce list recursively and use maps:from_list to make map, list should be:
-    %     [
-    %       {{new_test, Var1, Var2}, {TargetVar, CanonicalStuff}},
-    %       {{retraversal, Var1, Var2}, {TargetVar, CanonicalStuff}},
-    %       ...
-    %     ]
-    %
-    %     NOTE: targetvar missing
-    %
-    %ptrav_is Prel: #{{new_test,{b_var,0},{b_var,20}} =>
-    %                {{b_var,27},{'<',{b_var,0},{b_var,20}}},
-    %            {new_test,{b_var,2},{b_literal,nil}} =>
-    %                {{b_var,34},{'=:=',{b_var,2},{b_literal,nil}}},
-    %            {new_test,{b_var,31},{b_literal,4}} =>
-    %                {{b_var,32},{'=:=',{b_var,31},{b_literal,4}}},
-    %            {none,noVar,noVar} => {was_none},
-    %            {retraversal,{b_var,0},{b_var,20}} =>
-    %                {{b_var,28},{'=<',{b_var,0},{b_var,20}}}}
-    %
-    %     How to identify multiple retraversals? Do I even need to?
-    %     In case I (an instruction) is a 2nd traversal I need to do the same as the 1st traversal
-    %     (use the TargetVar of new_test, yeah?)
-    %
-    %     next up, lets traverse instructions and just print something when something should be done
-    %     (we worry about how to do that later, because I wonder how to br on something returned by erts_cmp)
-    %     Lets find a neat(er) way to traverse
-    %       - Here in beam_ssa_dead the most popular ways seems to be over basic blocks first (in RPO), the insns. In beam_ssa_opt there are some more compact examples of this.
-    %       - beam_ssa:fold_blocks could be interesting, but fold like reduce yeah?
-    %         Not sure how much sense that makes when building an entire list of insns again
-    %
-    %     DONE.
-    %
-    %     TODO: Now how in the world I manipulate those instructions?
-    %     Lets figure out what the ideal is on paper, yeah?
-    %     Subquestions:
-    %       - can we b_br directly on erts_cmp output?
-    %       - what is b_switch?
-    %
-    %       > The switch instruction is a multi-way branch to one of any number of other blocks, based on the value of a variable. In this example, it branches based on the value of the variable _0. If _0 is equal to 2, execution continues at block 5. If _0 is equal to 1, execution continues at block 4. If the value is not equal to any of the values in the switch list, execution continues at the block referred to by the failure label, in this example block 3.
-    %
-    %       https://www.erlang.org/blog/digging-deeper-in-ssa/
-    %
-    %       Could be useful! Maybe replacing the br with a switch is simpler than comparing on erts_cmp output
-    %
-    %       If I do this I need to make sure all uses of the (now non-bool variable) take the 
-    %       new -1, 0, 1 into consideration instead of a bool
-    %       do I have all uses of it by virtue of??? No :(
-    %
-    %
-    %
-    %       - or, need we apply the test on erts_cmp output?
-    %       - carefully juggle correctness
-    %       - how to insert an entirely new instruction with a new target var?
-    %
-    %
-    %       TODO VIB FOR NOW, just check if its single-use and do the switch thing.
-    %       Maybe single use is common.
-    %
-    %
-    %
-    
-    _Trav = trav(RPO2, Blocks2),
-    %io:format("Trav: ~p~n", [Trav]),
-    
-    Ptrav = ptrav(RPO2, Blocks2, maps:from_list(Prel), {uses,Trimmed}),
-    %io:format("Ptrav: ~p~n", [Ptrav]),
-    Trimmed2 = beam_ssa:trim_unreachable(Ptrav),
-    %io:format("Trimmed2: ~p~n", [Trimmed2]),
-    Trimmed2.
-
-var_single_use(Var, {uses,Linear}) ->
-    Blocks = maps:from_list(Linear),
+opt_test_traversals(Blocks) ->
+    All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
+    Prel = maps:from_list(prel(RPO, Blocks, All)),
     Uses = beam_ssa:uses(RPO, Blocks),
-    var_single_use(Var, Uses);
+    Ptrav = ptrav(RPO, Blocks, Prel, Uses),
+    beam_ssa:trim_unreachable(Ptrav).
+
+
 var_single_use(Var, Uses) when is_map(Uses) ->
     {case Uses of
          #{Var:=[_]} -> true;
@@ -1360,7 +1240,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                           % br is here, so just check single-ues, yeah?
 
                           {SingleUse, _} = var_single_use(BrVar, Uses0),
-                          case SingleUse of 
+                          case SingleUse of
                               true ->
                                   %io:format("parent targetvar SingleUse: ~p~n", [SingleUse]),
 
@@ -1406,7 +1286,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                           % TODO VIB: check single-use in br (note of both BrVar and parent, otherwise change was not applied to parent)
                           {ParentSingleUse, _} = var_single_use(ParentVar, Uses0),
                           {SingleUse, _} = var_single_use(BrVar, Uses0),
-                          case ParentSingleUse and SingleUse of 
+                          case ParentSingleUse and SingleUse of
                               true ->
                                   %io:format("retraversal SingleUse: ~p~n", [SingleUse]),
 
@@ -1436,7 +1316,7 @@ ptrav([L|Ls], Blocks, Prel, Uses0) ->
                   end,
             %io:format("retraversal modified SSA Blk after: ~p~n", [Blk]),
             [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses0)];
-        none -> 
+        none ->
             [{L, Blk0}|ptrav(Ls, Blocks, Prel, Uses0)]
     end;
 ptrav([], _Blocks, _Prel, _Uses0) -> [].
@@ -1496,6 +1376,7 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
     case Stodo of
         % TODO VIB: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
+            io:format("APPLYING OPTIMIATION~n"),
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
             %io:format("ptrav_is Stodo parent I: ~p~n", [I]),
 
@@ -1521,35 +1402,6 @@ ptrav_is([I|Is], Acc, Prel) ->
 ptrav_is([], _Acc, _Prel) -> none.
 
 
-
-%% Identity traversal for reference
-trav([L|Ls], Blocks) ->
-    Blk0 = map_get(L, Blocks),
-    #b_blk{is=Is0} = Blk0,
-    %io:format("Trav Is0: ~p~n", [Is0]),
-
-    trav_is(Is0, []),
-
-    [{L, Blk0}|trav(Ls, Blocks)];
-trav([], _Blocks) -> [].
-
-trav_is([#b_set{op=_Op,args=_Args,dst=_Bool}=_I0], _Acc) ->
-    % TODO
-    %io:format("trav_is Op: ~p~n", [Op]),
-    %io:format("trav_is Args: ~p~n", [Args]),
-    %io:format("trav_is Bool: ~p~n", [Bool]),
-    %io:format("trav_is I0: ~p~n", [I0]),
-    %io:format("trav_is Acc: ~p~n", [Acc]),
-    none;
-trav_is([I|Is], Acc) ->
-    trav_is(Is, [I|Acc]);
-trav_is([], _Acc) -> none.
-
-
-
-not_interesting(Was) ->
-    {{none,noVar,noVar},{Was}}.
-
 prel([L|Ls], Blocks, All0) ->
     %io:format("prel"),
     %io:format("L|Ls: ~p~n", [[L|Ls]]),
@@ -1564,13 +1416,13 @@ prel([L|Ls], Blocks, All0) ->
             case prel_is(Is0, Tests, []) of
                 none ->
                     All = update_successors(Blk1, Tests, All0),
-                    [not_interesting(was_none)|prel(Ls, Blocks, All)];
+                    prel(Ls, Blocks, All);
                 {new_test,Bool,Test,MustInvert} ->
                     All = update_successors(Blk1, Bool, Test, MustInvert,
                                             Tests, All0),
                     case Test of
                         {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All)];
-                        _ ->  [not_interesting(was_new_test)|prel(Ls, Blocks, All)]
+                        _ ->  prel(Ls, Blocks, All)
                     end;
                 {retraversal, Var1, Var2, Test, Bool} ->
                     [{{retraversal,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All0)];
@@ -1583,7 +1435,7 @@ prel([L|Ls], Blocks, All0) ->
                                   Blk2#b_blk{is=Is}
                           end,
                     All = update_successors(Blk, Tests, All0),
-                    [not_interesting(old_test)|prel(Ls, Blocks, All)]
+                    prel(Ls, Blocks, All)
             end;
         #{} ->
             prel(Ls, Blocks, All0)
@@ -1613,7 +1465,7 @@ prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
                             none
                     end;
                 none ->
-                    case retraversal(Test, Tests) of 
+                    case retraversal(Test, Tests) of
                         {true, Var1, Var2, Test} ->
                             %io:format("~p~n", ["retraversal"]),
                             {retraversal, Var1, Var2, Test, Bool};
