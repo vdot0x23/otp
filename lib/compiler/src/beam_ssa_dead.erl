@@ -1372,6 +1372,7 @@ prel([L|Ls], Blocks, All0) ->
                     All = update_successors(Blk1, Bool, Test, MustInvert, Tests, All0),
                     case Test of
                         {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All)];
+                        % only tests with two vars are considered
                         _ ->  prel(Ls, Blocks, All)
                     end;
                 {retraversal, Var1, Var2, Test, Bool} ->
@@ -1399,26 +1400,19 @@ prel_is([I|Is], Tests, Acc) ->
     prel_is(Is, Tests, [I|Acc]);
 prel_is([], _Tests, _Acc) -> none.
 
-
-
-
 retraversal(Test, Tests) ->
-    %io:format("retraversal checking Test: ~p~n", [Test]),
-    %io:format("retraversal against Tests: ~p~n", [Tests]),
     case Test of
         {_, Var1, Var2} ->
             case Tests of
                 %% do not match self
                 #{Test := _} -> false;
                 %% not sure if this is exhaustive nor correct, e.g. =:= not included for now
-                %% TODO VIB: Would be excellent to know which basic block it came from here to avoid scanning all predecessors
-                %% Maybe even the index in the list
                 #{{'==', Var1, Var2} := _} -> {true, Var1, Var2, Test};
                 #{{'=<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
                 #{{'<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
                 _ -> false
             end;
-        %% not all tests have two vars
+        %% not all tests have two vars and only those with two vars are considered
         _ -> false
     end.
 
