@@ -1216,10 +1216,10 @@ opt_test_traversals(Blocks) ->
     beam_ssa:trim_unreachable(Ptrav).
 
 var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
-    {case Uses of
-         #{Var:=[_]} -> true;
-         #{Var:=[_|_]} -> false
-     end,Uses}.
+    case Uses of
+        #{Var:=[_]} -> true;
+        #{Var:=[_|_]} -> false
+    end.
 
 create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) when is_boolean(MustInvert) ->
     Succ0 = case CanonicalOp of
@@ -1245,8 +1245,7 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
         {parent, Is, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          {SingleUse, _} = var_single_use(BrVar, Uses),
-                          case SingleUse of
+                          case var_single_use(BrVar, Uses) of
                               true ->
                                   Sw = create_switch(BrVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   Blk0#b_blk{is=Is,last=Sw};
@@ -1260,9 +1259,7 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
-                          {ParentSingleUse, _} = var_single_use(ParentVar, Uses),
-                          {SingleUse, _} = var_single_use(BrVar, Uses),
-                          case ParentSingleUse and SingleUse of
+                          case var_single_use(ParentVar, Uses) and var_single_use(BrVar, Uses) of
                               true ->
                                   Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   Blk0#b_blk{last=Sw};
@@ -1276,7 +1273,6 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
     end;
 ptrav([], _Blocks, _Prel, _Uses) -> [].
 
-
 lookup_test_vars(Prefix, Test, Prel) ->
     case Test of
         {_, Var1, Var2} ->
@@ -1288,7 +1284,6 @@ lookup_test_vars(Prefix, Test, Prel) ->
             _ -> {false, none, none}
     end.
 
-
 something_todo(Op, Args, Prel, Dst) ->
     case canonical_test(Op, Args) of
         none ->
@@ -1296,8 +1291,6 @@ something_todo(Op, Args, Prel, Dst) ->
         {Test, MustInvert} ->
             {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, Prel),
             {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, Prel),
-            %io:format("something_todo N: ~p~n", [N]),
-            %io:format("something_todo R: ~p~n", [R]),
             case {N, R} of
                 % New test and retraversal later
                 {{Dst, _}, {_, _}} ->
@@ -1319,32 +1312,12 @@ something_todo(Op, Args, Prel, Dst) ->
     end.
 
 ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
-    % TODO
-    %io:format("ptrav_is Op: ~p~n", [Op]),
-    %io:format("ptrav_is Args: ~p~n", [Args]),
-    %io:format("ptrav_is Dst: ~p~n", [Dst]),
-    %io:format("ptrav_is I0: ~p~n", [I0]),
-    %io:format("ptrav_is Acc: ~p~n", [Acc]),
-    %io:format("ptrav_is Prel: ~p~n", [Prel]),
-    Stodo = something_todo(Op, Args, Prel, Dst),
-    %io:format("ptrav_is Stodo: ~p~n", [Stodo]),
-    case Stodo of
+    case something_todo(Op, Args, Prel, Dst) of
         % TODO VIB: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
             io:format("APPLYING OPTIMIATION~n"),
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
-            %io:format("ptrav_is Stodo parent I: ~p~n", [I]),
-
-            % Operation = '<' | '=<' | '=:=' | '=='
-            % calc success conditions
             {CanonicalOp, _, _} = Test,
-            _Lbls = case CanonicalOp of
-                '<' -> {-1};
-                '=<' -> {-1, 0};
-                '=:=' -> {0};
-                '==' -> {0}
-            end,
-
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
         {retraversal, ParentVar, Test, MustInvert} ->
             {CanonicalOp, _, _} = Test,
@@ -1355,7 +1328,6 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
 ptrav_is([I|Is], Acc, Prel) ->
     ptrav_is(Is, [I|Acc], Prel);
 ptrav_is([], _Acc, _Prel) -> none.
-
 
 prel([L|Ls], Blocks, All0) ->
     case All0 of
