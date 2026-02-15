@@ -1250,15 +1250,14 @@ opt_redundant_tests(Blocks) ->
 %%%          { `0`, ^34 }
 %%%        ]
 %%%
-%%% This sub pass works in two phases:
-%%% The 1st phase keeps track of all tests that are known to have
-%%% been executed at each block in the SSA code and uses this to build
-%%% a map of new tests (i.e. potential parents) and retraversals to their
-%%% respective Test:
+%%% This sub pass works in two passes:
+%%% The 1st pass keeps track of all tests that are known to have
+%%% been executed at each block in the SSA code and uses this to categorize
+%%% tests into a map of new tests (i.e. potential parents) and retraversals:
 %%%
-%%% #{{new_test, ...} => {Test, ...}, {retraversal, ...} => {Test, ...}}
+%%% #{{new_test, ...} => {...}, {retraversal, ...} => {...}}
 %%%
-%%% The 2nd phase determines which new tests are parents of a retraversal.
+%%% The 2nd pass determines which new tests are parents of a retraversal.
 %%% It replaces parent tests with erts_cmp and the br with a switch.
 %%% It also replaces the br of retraversal tests with a switch
 %%% on the result of erts_cmp from the parent.
@@ -1271,9 +1270,9 @@ opt_redundant_tests(Blocks) ->
 opt_test_traversals(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
-    Prel = maps:from_list(prel(RPO, Blocks, All)),
+    CategorizedTests = maps:from_list(categorize_tests(RPO, Blocks, All)),
     Uses = beam_ssa:uses(RPO, Blocks),
-    Ptrav = ptrav(RPO, Blocks, Prel, {uses, Uses}),
+    Ptrav = ptrav(RPO, Blocks, CategorizedTests, {uses, Uses}),
     beam_ssa:trim_unreachable(Ptrav).
 
 var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
@@ -1299,10 +1298,10 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     SwTable = lists:merge(SuccTable, FailTable),
     beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
 
-ptrav([L|Ls], Blocks, Prel, Uses) ->
+ptrav([L|Ls], Blocks, CategorizedTests, Uses) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    case ptrav_is(Is0, [], Prel) of
+    case ptrav_is(Is0, [], CategorizedTests) of
         {parent, Is, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
@@ -1315,7 +1314,7 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
                           end;
                       #b_blk{} -> Blk0
                   end,
-            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses)];
+            [{L, Blk}|ptrav(Ls, Blocks, CategorizedTests, Uses)];
         {retraversal, ParentVar, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
@@ -1328,16 +1327,16 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
                           end;
                       #b_blk{} -> Blk0
                   end,
-            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses)];
+            [{L, Blk}|ptrav(Ls, Blocks, CategorizedTests, Uses)];
         none ->
-            [{L, Blk0}|ptrav(Ls, Blocks, Prel, Uses)]
+            [{L, Blk0}|ptrav(Ls, Blocks, CategorizedTests, Uses)]
     end;
-ptrav([], _Blocks, _Prel, _Uses) -> [].
+ptrav([], _Blocks, _CategorizedTests, _Uses) -> [].
 
-lookup_test_vars(Prefix, Test, Prel) ->
+lookup_test_vars(Prefix, Test, CategorizedTests) ->
     case Test of
         {_, Var1, Var2} ->
-            case Prel of
+            case CategorizedTests of
                 #{{Prefix, Var1, Var2} := Value} -> {Value, Var1, Var2};
                 _ -> {false, none, none}
             end;
@@ -1345,13 +1344,13 @@ lookup_test_vars(Prefix, Test, Prel) ->
             _ -> {false, none, none}
     end.
 
-something_todo(Op, Args, Prel, Dst) ->
+something_todo(Op, Args, CategorizedTests, Dst) ->
     case canonical_test(Op, Args) of
         none ->
             none;
         {Test, MustInvert} ->
-            {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, Prel),
-            {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, Prel),
+            {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, CategorizedTests),
+            {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, CategorizedTests),
             case {N, R} of
                 % New test and retraversal later
                 {{Dst, _}, {_, _}} ->
@@ -1372,11 +1371,11 @@ something_todo(Op, Args, Prel, Dst) ->
             end
     end.
 
-ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
-    case something_todo(Op, Args, Prel, Dst) of
-        % TODO VIB: returning both vars and Test is redundant
+ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
+    case something_todo(Op, Args, CategorizedTests, Dst) of
+        % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
-            %io:format("APPLYING OPTIMIATION~n"),
+            io:format("APPLYING OPTIMIATION~n"),
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
             {CanonicalOp, _, _} = Test,
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
@@ -1386,38 +1385,38 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
         none ->
             none
     end;
-ptrav_is([I|Is], Acc, Prel) ->
-    ptrav_is(Is, [I|Acc], Prel);
-ptrav_is([], _Acc, _Prel) -> none.
+ptrav_is([I|Is], Acc, CategorizedTests) ->
+    ptrav_is(Is, [I|Acc], CategorizedTests);
+ptrav_is([], _Acc, _CategorizedTests) -> none.
 
-prel([L|Ls], Blocks, All0) ->
+categorize_tests([L|Ls], Blocks, All0) ->
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
             Tests = map_get(L, All0),
             Blk1 = opt_switch(Blk0, Tests),
             #b_blk{is=Is0} = Blk1,
-            case prel_is(Is0, Tests, []) of
+            case categorize_is(Is0, Tests, []) of
                 none ->
                     All = update_successors(Blk1, Tests, All0),
-                    prel(Ls, Blocks, All);
+                    categorize_tests(Ls, Blocks, All);
                 {new_test,Bool,Test,MustInvert} ->
                     All = update_successors(Blk1, Bool, Test, MustInvert, Tests, All0),
                     case Test of
-                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All)];
+                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|categorize_tests(Ls, Blocks, All)];
                         % only tests with two vars are considered
-                        _ ->  prel(Ls, Blocks, All)
+                        _ ->  categorize_tests(Ls, Blocks, All)
                     end;
                 {retraversal, Var1, Var2, Test, Bool} ->
-                    [{{retraversal,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All0)]
+                    [{{retraversal,Var1,Var2},{Bool,Test}}|categorize_tests(Ls, Blocks, All0)]
             end;
         #{} ->
-            prel(Ls, Blocks, All0)
+            categorize_tests(Ls, Blocks, All0)
     end;
-prel([], _Blocks, _All) -> [].
+categorize_tests([], _Blocks, _All) -> [].
 
 
-prel_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
+categorize_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
     case canonical_test(Op, Args) of
         none ->
             none;
@@ -1429,9 +1428,9 @@ prel_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
                     {new_test,Bool,Test,MustInvert}
             end
     end;
-prel_is([I|Is], Tests, Acc) ->
-    prel_is(Is, Tests, [I|Acc]);
-prel_is([], _Tests, _Acc) -> none.
+categorize_is([I|Is], Tests, Acc) ->
+    categorize_is(Is, Tests, [I|Acc]);
+categorize_is([], _Tests, _Acc) -> none.
 
 retraversal(Test, Tests) ->
     case Test of
