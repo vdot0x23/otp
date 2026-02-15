@@ -1211,115 +1211,69 @@ opt_test_traversals(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
     Prel = maps:from_list(prel(RPO, Blocks, All)),
     Uses = beam_ssa:uses(RPO, Blocks),
-    Ptrav = ptrav(RPO, Blocks, Prel, Uses),
+    Ptrav = ptrav(RPO, Blocks, Prel, {uses, Uses}),
     beam_ssa:trim_unreachable(Ptrav).
 
-
-var_single_use(Var, Uses) when is_map(Uses) ->
+var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
     {case Uses of
          #{Var:=[_]} -> true;
          #{Var:=[_|_]} -> false
      end,Uses}.
 
-%% Print traversal
-ptrav([L|Ls], Blocks, Prel, Uses0) ->
+create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) when is_boolean(MustInvert) ->
+    Succ0 = case CanonicalOp of
+        '<' -> [-1];
+        '=<' -> [-1, 0];
+        '=:=' -> [0];
+        '==' -> [0]
+    end,
+    Fail0 = [-1,0,1] -- Succ0,
+    {Fail,Succ} = case MustInvert of
+        true -> {Succ0,Fail0};
+        false -> {Fail0,Succ0}
+    end,
+    SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
+    FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
+    SwTable = lists:merge(SuccTable, FailTable),
+    beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
+
+ptrav([L|Ls], Blocks, Prel, Uses) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    %io:format("ptrav Is0: ~p~n", [Is0]),
-
     case ptrav_is(Is0, [], Prel) of
         {parent, Is, CanonicalOp, MustInvert} ->
-            % #b_switch{arg=Arg,fail=Fail,list=[{Lit,Lbl}]}
-            % Blk = case Blk0 of ...
-            % last=switch...
-            % is=Is
-            %io:format("parent modified SSA Blk before: ~p~n", [Blk0]),
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          % TODO VIB: check single-use in br
-                          % br is here, so just check single-ues, yeah?
-
-                          {SingleUse, _} = var_single_use(BrVar, Uses0),
+                          {SingleUse, _} = var_single_use(BrVar, Uses),
                           case SingleUse of
                               true ->
-                                  %io:format("parent targetvar SingleUse: ~p~n", [SingleUse]),
-
-                                  Succ0 = case CanonicalOp of
-                                              '<' -> [-1];
-                                              '=<' -> [-1, 0];
-                                              '=:=' -> [0];
-                                              '==' -> [0]
-                                          end,
-                                  Fail0 = [-1,0,1] -- Succ0,
-
-                                  {Fail,Succ} = case MustInvert of
-                                                    true -> {Succ0,Fail0};
-                                                    false -> {Fail0,Succ0}
-                                                end,
-
-
-                                  SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
-                                  FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
-                                  %
-                                  % calc fail from success labels
-                                  % [-1,0,1] -- [-1]
-
-                                  SwTable = lists:merge(SuccTable, FailTable),
-                                  %io:format("FailLbl: ~p~n", [FailLbl]),
-                                  Swi = #b_switch{arg=BrVar,fail=FailLbl,list=SwTable},
-                                  %io:format("Swi: ~p~n", [Swi]),
-                                  Sw = beam_ssa:normalize(Swi),
-                                  %io:format("Sw: ~p~n", [Sw]),
+                                  Sw = create_switch(BrVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   Blk0#b_blk{is=Is,last=Sw};
                               false ->
                                   Blk0
                           end;
                       #b_blk{} -> Blk0
                   end,
-            %io:format("parent modified SSA Blk after: ~p~n", [Blk]),
-            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses0)];
+            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses)];
         {retraversal, ParentVar, CanonicalOp, MustInvert} ->
-            %io:format("retraversal ParentVar: ~p~n", [ParentVar]),
-            %io:format("retraversal modified SSA Blk before: ~p~n", [Blk0]),
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % TODO VIB: check single-use in br (note of both BrVar and parent, otherwise change was not applied to parent)
-                          {ParentSingleUse, _} = var_single_use(ParentVar, Uses0),
-                          {SingleUse, _} = var_single_use(BrVar, Uses0),
+                          {ParentSingleUse, _} = var_single_use(ParentVar, Uses),
+                          {SingleUse, _} = var_single_use(BrVar, Uses),
                           case ParentSingleUse and SingleUse of
                               true ->
-                                  %io:format("retraversal SingleUse: ~p~n", [SingleUse]),
-
-                                  Succ0 = case CanonicalOp of
-                                              '<' -> [-1];
-                                              '=<' -> [-1, 0];
-                                              '=:=' -> [0];
-                                              '==' -> [0]
-                                          end,
-                                  Fail0 = [-1,0,1] -- Succ0,
-
-                                  {Fail,Succ} = case MustInvert of
-                                                    true -> {Succ0,Fail0};
-                                                    false -> {Fail0,Succ0}
-                                                end,
-
-
-                                  SuccTable = lists:map(fun(X) -> {#b_literal{val=X},SuccLbl} end, Succ),
-                                  FailTable = lists:map(fun(X) -> {#b_literal{val=X},FailLbl} end, Fail),
-
-                                  SwTable = lists:merge(SuccTable, FailTable),
-                                  Sw = beam_ssa:normalize(#b_switch{arg=ParentVar,fail=FailLbl,list=SwTable}),
+                                  Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   Blk0#b_blk{last=Sw};
                               false -> Blk0
                           end;
                       #b_blk{} -> Blk0
                   end,
-            %io:format("retraversal modified SSA Blk after: ~p~n", [Blk]),
-            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses0)];
+            [{L, Blk}|ptrav(Ls, Blocks, Prel, Uses)];
         none ->
-            [{L, Blk0}|ptrav(Ls, Blocks, Prel, Uses0)]
+            [{L, Blk0}|ptrav(Ls, Blocks, Prel, Uses)]
     end;
-ptrav([], _Blocks, _Prel, _Uses0) -> [].
+ptrav([], _Blocks, _Prel, _Uses) -> [].
 
 
 lookup_test_vars(Prefix, Test, Prel) ->
@@ -1403,10 +1357,6 @@ ptrav_is([], _Acc, _Prel) -> none.
 
 
 prel([L|Ls], Blocks, All0) ->
-    %io:format("prel"),
-    %io:format("L|Ls: ~p~n", [[L|Ls]]),
-    %io:format("Blocks 2: ~p~n", [Blocks]),
-    %io:format("All0: ~p~n", [All0]),
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
