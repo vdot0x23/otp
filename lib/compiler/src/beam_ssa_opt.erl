@@ -1121,7 +1121,6 @@ cse_intersection(M1, M2) ->
             cse_intersection_1(maps:to_list(M1), M2, M1)
     end.
 
-%% TODO VIB: benchmark against intersect_with wher the Combiner checks value equality
 cse_intersection_1([{Key,Value}|KVs], M, Result) ->
     case M of
         #{Key := Value} ->

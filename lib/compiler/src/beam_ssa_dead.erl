@@ -1199,7 +1199,6 @@ lit_type(Val) ->
 %%%     end
 %%%
 
-% Blocks is #{0 => {b_blk ...
 opt_redundant_tests(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
@@ -1465,11 +1464,8 @@ opt_redundant_tests([L|Ls], Blocks, All0) ->
                     [{L,Blk1}|opt_redundant_tests(Ls, Blocks, All)];
                 {old_test,Is,BoolVar,BoolValue} ->
                     Blk = case Blk1 of
-                              % match that BoolVar is same
                               #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
-                                  % construction of new
                                   Br = beam_ssa:normalize(Br0#b_br{bool=BoolValue}),
-                                  % use of / return new
                                   Blk1#b_blk{is=Is,last=Br};
                               #b_blk{}=Blk2 ->
                                   Blk2#b_blk{is=Is}
