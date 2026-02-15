@@ -1272,8 +1272,8 @@ opt_test_traversals(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
     CategorizedTests = maps:from_list(categorize_tests(RPO, Blocks, All)),
     Uses = beam_ssa:uses(RPO, Blocks),
-    Ptrav = ptrav(RPO, Blocks, CategorizedTests, {uses, Uses}),
-    beam_ssa:trim_unreachable(Ptrav).
+    Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
+    beam_ssa:trim_unreachable(Linear).
 
 var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
     case Uses of
@@ -1298,7 +1298,7 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     SwTable = lists:merge(SuccTable, FailTable),
     beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
 
-ptrav([L|Ls], Blocks, CategorizedTests, Uses) ->
+opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
     case ptrav_is(Is0, [], CategorizedTests) of
@@ -1314,7 +1314,7 @@ ptrav([L|Ls], Blocks, CategorizedTests, Uses) ->
                           end;
                       #b_blk{} -> Blk0
                   end,
-            [{L, Blk}|ptrav(Ls, Blocks, CategorizedTests, Uses)];
+            [{L, Blk}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)];
         {retraversal, ParentVar, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
@@ -1327,11 +1327,11 @@ ptrav([L|Ls], Blocks, CategorizedTests, Uses) ->
                           end;
                       #b_blk{} -> Blk0
                   end,
-            [{L, Blk}|ptrav(Ls, Blocks, CategorizedTests, Uses)];
+            [{L, Blk}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)];
         none ->
-            [{L, Blk0}|ptrav(Ls, Blocks, CategorizedTests, Uses)]
+            [{L, Blk0}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)]
     end;
-ptrav([], _Blocks, _CategorizedTests, _Uses) -> [].
+opt_test_traversals([], _Blocks, _CategorizedTests, _Uses) -> [].
 
 lookup_test_vars(Prefix, Test, CategorizedTests) ->
     case Test of
@@ -1344,7 +1344,7 @@ lookup_test_vars(Prefix, Test, CategorizedTests) ->
             _ -> {false, none, none}
     end.
 
-optimizeable_test(Op, Args, CategorizedTests, Dst) ->
+optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) ->
     case canonical_test(Op, Args) of
         none ->
             none;
@@ -1372,7 +1372,7 @@ optimizeable_test(Op, Args, CategorizedTests, Dst) ->
     end.
 
 ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
-    case optimizeable_test(Op, Args, CategorizedTests, Dst) of
+    case optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) of
         % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
             io:format("APPLYING OPTIMIATION~n"),
