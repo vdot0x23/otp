@@ -1206,6 +1206,7 @@ opt_redundant_tests(Blocks) ->
     Linear = opt_redundant_tests(RPO, Blocks, All),
     beam_ssa:trim_unreachable(Linear).
 
+%% vocab: new_test at first, only a parent when a 'child' retraversal has been confirmed
 opt_test_traversals(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
@@ -1258,7 +1259,7 @@ ptrav([L|Ls], Blocks, Prel, Uses) ->
         {retraversal, ParentVar, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          % TODO VIB: check single-use in br (note of both BrVar and parent, otherwise change was not applied to parent)
+                          % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
                           {ParentSingleUse, _} = var_single_use(ParentVar, Uses),
                           {SingleUse, _} = var_single_use(BrVar, Uses),
                           case ParentSingleUse and SingleUse of
@@ -1368,24 +1369,13 @@ prel([L|Ls], Blocks, All0) ->
                     All = update_successors(Blk1, Tests, All0),
                     prel(Ls, Blocks, All);
                 {new_test,Bool,Test,MustInvert} ->
-                    All = update_successors(Blk1, Bool, Test, MustInvert,
-                                            Tests, All0),
+                    All = update_successors(Blk1, Bool, Test, MustInvert, Tests, All0),
                     case Test of
                         {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All)];
                         _ ->  prel(Ls, Blocks, All)
                     end;
                 {retraversal, Var1, Var2, Test, Bool} ->
-                    [{{retraversal,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All0)];
-                {old_test,Is,BoolVar,BoolValue} ->
-                    Blk = case Blk1 of
-                              #b_blk{last=#b_br{bool=BoolVar}=Br0} ->
-                                  Br = beam_ssa:normalize(Br0#b_br{bool=BoolValue}),
-                                  Blk1#b_blk{is=Is,last=Br};
-                              #b_blk{}=Blk2 ->
-                                  Blk2#b_blk{is=Is}
-                          end,
-                    All = update_successors(Blk, Tests, All0),
-                    prel(Ls, Blocks, All)
+                    [{{retraversal,Var1,Var2},{Bool,Test}}|prel(Ls, Blocks, All0)]
             end;
         #{} ->
             prel(Ls, Blocks, All0)
@@ -1393,35 +1383,16 @@ prel([L|Ls], Blocks, All0) ->
 prel([], _Blocks, _All) -> [].
 
 
-prel_is([#b_set{op=Op,args=Args,dst=Bool}=I0], Tests, Acc) ->
-    %io:format("prel_is"),
+prel_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
     case canonical_test(Op, Args) of
         none ->
             none;
         {Test,MustInvert} ->
-            case old_result(Test, Tests) of
-                Result0 when is_boolean(Result0) ->
-                    case gains_type_information(I0) of
-                        false ->
-                            Result = #b_literal{val=Result0 xor MustInvert},
-                            I = I0#b_set{op={bif,'=:='},args=[Result,#b_literal{val=true}]},
-                            {old_test,reverse(Acc, [I]),Bool,Result};
-                        true ->
-                            %% At least one variable will gain type
-                            %% information from this `=:=`
-                            %% operation. Removing it could make it
-                            %% impossible for beam_validator to
-                            %% realize that the code is type-safe.
-                            none
-                    end;
-                none ->
-                    case retraversal(Test, Tests) of
-                        {true, Var1, Var2, Test} ->
-                            %io:format("~p~n", ["retraversal"]),
-                            {retraversal, Var1, Var2, Test, Bool};
-                        false ->
-                            {new_test,Bool,Test,MustInvert}
-                    end
+            case retraversal(Test, Tests) of
+                {true, Var1, Var2, Test} ->
+                    {retraversal, Var1, Var2, Test, Bool};
+                false ->
+                    {new_test,Bool,Test,MustInvert}
             end
     end;
 prel_is([I|Is], Tests, Acc) ->
