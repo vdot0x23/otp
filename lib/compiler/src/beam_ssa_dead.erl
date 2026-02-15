@@ -1344,7 +1344,7 @@ lookup_test_vars(Prefix, Test, CategorizedTests) ->
             _ -> {false, none, none}
     end.
 
-something_todo(Op, Args, CategorizedTests, Dst) ->
+optimizeable_test(Op, Args, CategorizedTests, Dst) ->
     case canonical_test(Op, Args) of
         none ->
             none;
@@ -1372,7 +1372,7 @@ something_todo(Op, Args, CategorizedTests, Dst) ->
     end.
 
 ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
-    case something_todo(Op, Args, CategorizedTests, Dst) of
+    case optimizeable_test(Op, Args, CategorizedTests, Dst) of
         % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
             io:format("APPLYING OPTIMIATION~n"),
