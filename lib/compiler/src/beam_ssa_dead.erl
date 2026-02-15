@@ -1206,7 +1206,68 @@ opt_redundant_tests(Blocks) ->
     Linear = opt_redundant_tests(RPO, Blocks, All),
     beam_ssa:trim_unreachable(Linear).
 
-%% vocab: new_test at first, only a parent when a 'child' retraversal has been confirmed
+%%%
+%%% Replace consecutive tests with a call to erts_internal:cmp_term.
+%%%
+%%% Consecutive tests are present in idiomatic Erlang code such as:
+%%%
+%%%     case L of
+%%%	       [] -> ...;
+%%%	       [Z] when Y < Z -> ...;
+%%%	       [Z] when Z > Y -> ...;
+%%%        ...
+%%%
+%%% If Y and Z are datastructures such as gb_trees or lists,
+%%% they are traversed repeatedly.
+%%% This sub pass rewrites consecutive tests to traverse datastructures only once.
+%%% For example, it may rewrite from:
+%%%
+%%%     _34 = bif:'==' _2, _16  %% We call this a parent
+%%%     br _34, ^34, ^33
+%%%     ...
+%%%     _36 = bif:'<' _2, _16  %% We call this a retraversal
+%%%     br _36, ^36, ^32
+%%%
+%%% To:
+%%%
+%%%     _34 = call (`erts_internal`:`cmp_term`/2), _2, _16
+%%%     switch _34, ^32, [
+%%%       { `-1`, ^32 },
+%%%       { `0`, ^36 },
+%%%       { `-1`, ^32 },
+%%%     ]
+%%%     ...
+%%%     switch _34, ^32, [
+%%%       { `-1`, ^36 },
+%%%       { `0`, ^32 },
+%%%       { `-1`, ^32 },
+%%%     ]
+%%%
+%%% Which in this case is optimized by later passes into a single switch:
+%%%
+%%%    switch _34, ^32, [
+%%%          { `-1`, ^36 },
+%%%          { `0`, ^34 }
+%%%        ]
+%%%
+%%% This sub pass works in two phases:
+%%% The 1st phase keeps track of all tests that are known to have
+%%% been executed at each block in the SSA code and uses this to build
+%%% a map of new tests (i.e. potential parents) and retraversals to their
+%%% respective Test:
+%%%
+%%% #{{new_test, ...} => {Test, ...}, {retraversal, ...} => {Test, ...}}
+%%%
+%%% The 2nd phase determines which new tests are parents of a retraversal.
+%%% It replaces parent tests with erts_cmp and the br with a switch.
+%%% It also replaces the br of retraversal tests with a switch
+%%% on the result of erts_cmp from the parent.
+%%%
+%%% This optimization is only applied when the previously boolean variables
+%%% are single-use in br. In principle all uses of the previously boolean
+%%% variables could be adjusted to handle -1, 0, 1 (from erts_cmp) but
+%%% for the time being they are not.
+%%%
 opt_test_traversals(Blocks) ->
     All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
@@ -1315,7 +1376,7 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Prel) ->
     case something_todo(Op, Args, Prel, Dst) of
         % TODO VIB: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
-            io:format("APPLYING OPTIMIATION~n"),
+            %io:format("APPLYING OPTIMIATION~n"),
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
             {CanonicalOp, _, _} = Test,
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
