@@ -1301,7 +1301,7 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
 opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    case ptrav_is(Is0, [], CategorizedTests) of
+    case opt_test_traversals_is(Is0, [], CategorizedTests) of
         {parent, Is, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
@@ -1371,7 +1371,7 @@ optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) ->
             end
     end.
 
-ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
+opt_test_traversals_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
     case optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) of
         % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
@@ -1385,9 +1385,9 @@ ptrav_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
         none ->
             none
     end;
-ptrav_is([I|Is], Acc, CategorizedTests) ->
-    ptrav_is(Is, [I|Acc], CategorizedTests);
-ptrav_is([], _Acc, _CategorizedTests) -> none.
+opt_test_traversals_is([I|Is], Acc, CategorizedTests) ->
+    opt_test_traversals_is(Is, [I|Acc], CategorizedTests);
+opt_test_traversals_is([], _Acc, _CategorizedTests) -> none.
 
 categorize_tests([L|Ls], Blocks, All0) ->
     case All0 of
