@@ -1318,7 +1318,7 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
-                          case var_single_use(ParentVar, Uses) and var_single_use(BrVar, Uses) of
+                          case var_single_use(ParentVar, Uses) andalso var_single_use(BrVar, Uses) of
                               true ->
                                   Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   Blk0#b_blk{last=Sw};
