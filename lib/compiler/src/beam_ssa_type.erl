@@ -424,11 +424,8 @@ sig_update_args_1(Callee, Types, #sig_st{updates=Us0,wl=Wl0}=State) ->
       FuncDb :: func_info_db().
 opt_continue(Linear0, Args, Anno, FuncDb) when FuncDb =/= #{} ->
     Id = get_func_id(Anno),
-    %io:format("opt_continue Id ~p~n", [Id]),
-    %io:format("opt_continue FuncDb ~p~n", [Id]),
     case FuncDb of
         #{ Id := #func_info{exported=false,arg_types=ArgTypes} } ->
-            %io:format("opt_continue ArgTypes ~p~n", [ArgTypes]),
             %% This is a local function and we're guaranteed to have visited
             %% every call site at least once, so we know that the parameter
             %% types are at least as narrow as the join of all argument types.
@@ -521,23 +518,12 @@ opt_bs([{L, #b_blk{is=Is0,last=Last0}=Blk0} | Bs],
        Ds0, Ls0, Fdb0, Sub0, SuccTypes0, Meta, Acc) ->
     case Ls0 of
         #{ L := Incoming } ->
-            %% TODO VIB: consider printing some stuff
             {incoming, Ts0} = Incoming,         %Assertion.
 
-            Before = {Is0, Ts0, Ds0, Ls0, Fdb0, Sub0, Meta, []},
             {Is, Ts, Ds, Fdb, Sub} =
                 opt_is(Is0, Ts0, Ds0, Ls0, Fdb0, Sub0, Meta, []),
-            After = {Is, Ts, Ds, Fdb, Sub},
 
-            Last1 = try simplify_terminator(Last0, Ts, Ds, Sub) of
-                R -> R
-            catch
-                Class:Error:Stack ->
-                    io:format("opt_bs before opt_is ~p~n", [Before]),
-                    io:format("opt+bs after opt_is ~p~n", [After]),
-                    io:format("Before == After ~p~n", [Before == After]),
-                    erlang:raise(Class, Error, Stack)
-            end,
+            Last1 = simplify_terminator(Last0, Ts, Ds, Sub),
             SuccTypes = update_success_types(Last1, Ts, Ds, Meta, SuccTypes0),
 
             UsedOnce = Meta#metadata.used_once,
@@ -984,10 +970,6 @@ simplify_terminator(#b_br{bool=Bool}=Br0, Ts, Ds, Sub) ->
     simplify_not(Br, Ts, Ds, Sub);
 simplify_terminator(#b_switch{arg=Arg0,fail=Fail,list=List0}=Sw0,
                     Ts, Ds, Sub) ->
-    %io:format("simplify_terminator Sw0 ~p~n", [Sw0]),
-    %io:format("simplify_terminator Ts ~p~n", [Ts]),
-    %io:format("simplify_terminator Ds ~p~n", [Ds]),
-    %io:format("simplify_terminator Sub ~p~n", [Sub]),
     Arg = simplify_arg(Arg0, Ts, Sub),
     %% Ensure that no label in the switch list is the same as the
     %% failure label.
@@ -2539,8 +2521,6 @@ concrete_types(Values, Ts) ->
 concrete_type(#b_literal{val=Value}, _Ts) ->
     beam_types:make_type_from_value(Value);
 concrete_type(#b_var{}=Var, Ts) ->
-    %io:format("concrete_type Var ~p~n", [Var]),
-    %io:format("concrete_type Ts ~p~n", [Ts]),
     #{ Var := Type } = Ts,
     case is_function(Type) of
         true -> Type(Ts);
