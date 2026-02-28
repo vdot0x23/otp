@@ -1254,7 +1254,10 @@ opt_redundant_tests(Blocks) ->
 %%% been executed at each block in the SSA code and uses this to categorize
 %%% tests into a map of new tests (i.e. potential parents) and retraversals:
 %%%
-%%% #{{new_test, ...} => {...}, {retraversal, ...} => {...}}
+%%% #{new_test =>
+%%%      #{{b_var,27} => {'<',{b_var,2},{b_literal,{3,3}}},
+%%%        {b_var,31} => {'<',{b_var,2},{b_literal,{3,3}}}},
+%%%  retraversal => #{{b_var,19} => {'==',{b_var,2},{b_literal,{3,3}}}}}
 %%%
 %%% The 2nd pass determines which new tests are parents of a retraversal.
 %%% It replaces parent tests with erts_cmp and the br with a switch.
@@ -1271,12 +1274,12 @@ opt_test_traversals(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
     % TODO: if CategorizedTests is an empty map we can fast-path return
     % even better: skip if no retraversals
-    CategorizedTests = maps:from_list(categorize_tests(RPO, Blocks, All)),
+    CategorizedTests = categorize_tests(RPO, Blocks, All),
     io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
     Uses = beam_ssa:uses(RPO, Blocks),
-    io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
+    %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
     Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
-    io:format("Linear after: ~n~p~n", [Linear]),
+    %io:format("Linear after: ~n~p~n", [Linear]),
     beam_ssa:trim_unreachable(Linear).
 
 var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
@@ -1303,6 +1306,23 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     SwTable = lists:merge(SuccTable, FailTable),
     beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
 
+-define(DEFAULT_CATEGORIZED_TESTS,
+    #{
+        new_test => #{
+            dsts => #{},
+            dst_by_vars => #{}
+        },
+        retraversal => #{
+            test_by_dst => #{},
+            vars => #{}
+        }
+    }
+).
+
+opt_test_traversals(_Ls, Blocks, CategorizedTests, _Uses) when CategorizedTests =:= ?DEFAULT_CATEGORIZED_TESTS ->
+    % skip pass if no opportunities for optimization were found
+    io:format("skipped~n"),
+    beam_ssa:linearize(Blocks);
 opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
@@ -1327,7 +1347,7 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
-                          case var_single_use(ParentVar, Uses) and var_single_use(BrVar, Uses) of
+                          case var_single_use(ParentVar, Uses) andalso var_single_use(BrVar, Uses) of
                               true ->
                                   io:format("retraversal block before: ~n~p~n", [Blk0]),
                                   Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
@@ -1344,41 +1364,45 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
     end;
 opt_test_traversals([], _Blocks, _CategorizedTests, _Uses) -> [].
 
-lookup_test_vars(Prefix, Test, CategorizedTests) ->
-    case Test of
-        {_, Var1, Var2} ->
-            case CategorizedTests of
-                #{{Prefix, Var1, Var2} := Value} -> {Value, Var1, Var2};
-                _ -> {false, none, none}
-            end;
-            % not all tests have two variables
-            _ -> {false, none, none}
+arith_test(Op, Args) ->
+    CanonicalTest = canonical_test(Op, Args),
+    case CanonicalTest of
+        {{'==', _, _}, _} -> CanonicalTest;
+        {{'=<', _, _}, _} -> CanonicalTest;
+        {{'<', _, _}, _} -> CanonicalTest;
+        {{'=:=', _, _}, _} -> none;
+        %%% only tests with two vars are considered
+        _ -> none
     end.
 
 optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) ->
-    case canonical_test(Op, Args) of
+    case arith_test(Op, Args) of
         none ->
             none;
         {Test, MustInvert} ->
-            {N, NVar1, NVar2} = lookup_test_vars(new_test, Test, CategorizedTests),
-            {R, _RVar1, _RVar2} = lookup_test_vars(retraversal, Test, CategorizedTests),
-            case {N, R} of
-                % New test and retraversal later
-                {{Dst, _}, {_, _}} ->
-                    {parent, NVar1, NVar2, Test, MustInvert};
-                % New test prev. and retraversal now
-                {{ParentDst, _}, {Dst, _}} ->
-                    {retraversal, ParentDst, Test, MustInvert};
-                % Test variables match, but dst var does not
-                {{_, _}, {_, _}} ->
-                    none;
-                % New test, no retraversal later
-                {{_, _}, false} ->
-                    none;
-                % No match at all, possible for e.g. single variable test
-                {false, false} ->
-                    none
-                % no new test prev. while retraversal later should not be possible
+            #{
+                new_test := #{
+                    dsts := NewTestDsts,
+                    dst_by_vars := NewTestDstByVars
+                },
+                retraversal := #{
+                    test_by_dst := RetraversalByDst,
+                    vars := RetraversalVars
+                }
+            } = CategorizedTests,
+            IsNewTest = maps:is_key(Dst, NewTestDsts),
+            IsRetraversal = maps:is_key(Dst, RetraversalByDst),
+            {_, Var1, Var2} = Test,
+            RetraversalLater = maps:is_key({Var1, Var2}, RetraversalVars),
+            case {IsNewTest, IsRetraversal} of
+                {false, false} -> none;
+                {true, false} when RetraversalLater ->
+                    {parent, Var1, Var2, Test, MustInvert};
+                {true, false} -> none;
+                {false, true} ->
+                    ParentDst = maps:get({Var1, Var2}, NewTestDstByVars),
+                    {retraversal, ParentDst, Test, MustInvert}
+                %% Other cases should have been skipped
             end
     end.
 
@@ -1400,7 +1424,9 @@ opt_test_traversals_is([I|Is], Acc, CategorizedTests) ->
     opt_test_traversals_is(Is, [I|Acc], CategorizedTests);
 opt_test_traversals_is([], _Acc, _CategorizedTests) -> none.
 
-categorize_tests([L|Ls], Blocks, All0) ->
+categorize_tests(Ls, Blocks, All0) ->
+    categorize_tests(Ls, Blocks, All0, ?DEFAULT_CATEGORIZED_TESTS).
+categorize_tests([L|Ls], Blocks, All0, Acc) ->
     case All0 of
         #{L := Tests} ->
             Blk0 = map_get(L, Blocks),
@@ -1410,25 +1436,50 @@ categorize_tests([L|Ls], Blocks, All0) ->
             case categorize_is(Is0, Tests, []) of
                 none ->
                     All = update_successors(Blk1, Tests, All0),
-                    categorize_tests(Ls, Blocks, All);
+                    categorize_tests(Ls, Blocks, All, Acc);
                 {new_test,Bool,Test,MustInvert} ->
                     All = update_successors(Blk1, Bool, Test, MustInvert, Tests, All0),
-                    case Test of
-                        {_,Var1,Var2} -> [{{new_test,Var1,Var2},{Bool,Test}}|categorize_tests(Ls, Blocks, All)]
-                        %%% only tests with two vars are considered
-                        %%_ ->  categorize_tests(Ls, Blocks, All)
-                    end;
-                {retraversal, Var1, Var2, Test, Bool} ->
-                    [{{retraversal,Var1,Var2},{Bool,Test}}|categorize_tests(Ls, Blocks, All0)]
+                    {_, Var1, Var2} = Test,
+                    Dst = Bool,
+                    #{
+                        new_test := #{
+                            dsts := TestByDst,
+                            dst_by_vars := DstByVars
+                        } = NewTests
+                    } = Acc,
+                    NewAcc = Acc#{
+                        new_test := NewTests#{
+                            % TODO VIB: test here is just for debug
+                            dsts := TestByDst#{Dst => Test},
+                            dst_by_vars := DstByVars#{{Var1, Var2} => Dst}
+                        }
+                    },
+                    categorize_tests(Ls, Blocks, All, NewAcc);
+                {retraversal, _Var1, _Var2, Test, Bool} ->
+                    {_, Var1, Var2} = Test,
+                    Dst = Bool,
+                    #{
+                        retraversal := #{
+                            test_by_dst := TestByDst,
+                            vars := Vars
+                        } = Retraversals
+                    } = Acc,
+                    NewAcc = Acc#{
+                        retraversal := Retraversals#{
+                            test_by_dst := TestByDst#{Dst => Test},
+                            vars := Vars#{{Var1, Var2} => none}
+                        }
+                    },
+                    categorize_tests(Ls, Blocks, All0, NewAcc)
             end;
         #{} ->
-            categorize_tests(Ls, Blocks, All0)
+            categorize_tests(Ls, Blocks, All0, Acc)
     end;
-categorize_tests([], _Blocks, _All) -> [].
+categorize_tests([], _Blocks, _All, Acc) -> Acc.
 
 
 categorize_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
-    case canonical_test(Op, Args) of
+    case arith_test(Op, Args) of
         none ->
             none;
         {Test,MustInvert} ->
@@ -1452,11 +1503,13 @@ new_test(Test) ->
         {'=<', _, _} -> true;
         {'<', _, _} -> true;
         {'=:=', _, _} -> false;
+        %%% only tests with two vars are considered
         _ -> false
     end.
 
 lookup_parent(Test, Tests, Var1, Var2) ->
     case Tests of
+        %% TODO VIB: We need Dst or something here as well to determine if it truly is self
         %% parent
         %% do not match self
         #{Test := _} -> false;
