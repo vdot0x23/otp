@@ -1270,11 +1270,10 @@ opt_redundant_tests(Blocks) ->
 %%% for the time being they are not.
 %%%
 opt_test_traversals(Blocks) ->
-    All = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
     RPO = beam_ssa:rpo(Blocks),
     % TODO: if CategorizedTests is an empty map we can fast-path return
     % even better: skip if no retraversals
-    CategorizedTests = categorize_tests(RPO, Blocks, All),
+    CategorizedTests = categorize_tests(RPO, Blocks),
     io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
     Uses = beam_ssa:uses(RPO, Blocks),
     %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
@@ -1320,6 +1319,7 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
 ).
 
 opt_test_traversals(_Ls, Blocks, CategorizedTests, _Uses) when CategorizedTests =:= ?DEFAULT_CATEGORIZED_TESTS ->
+    % TODO VIB: should actually be when retraversals is default
     % skip pass if no opportunities for optimization were found
     io:format("skipped~n"),
     beam_ssa:linearize(Blocks);
@@ -1424,111 +1424,70 @@ opt_test_traversals_is([I|Is], Acc, CategorizedTests) ->
     opt_test_traversals_is(Is, [I|Acc], CategorizedTests);
 opt_test_traversals_is([], _Acc, _CategorizedTests) -> none.
 
-categorize_tests(Ls, Blocks, All0) ->
-    categorize_tests(Ls, Blocks, All0, ?DEFAULT_CATEGORIZED_TESTS).
-categorize_tests([L|Ls], Blocks, All0, Acc) ->
-    case All0 of
-        #{L := Tests} ->
-            Blk0 = map_get(L, Blocks),
-            Tests = map_get(L, All0),
-            Blk1 = opt_switch(Blk0, Tests),
-            #b_blk{is=Is0} = Blk1,
-            case categorize_is(Is0, Tests, []) of
-                none ->
-                    All = update_successors(Blk1, Tests, All0),
-                    categorize_tests(Ls, Blocks, All, Acc);
-                {new_test,Bool,Test,MustInvert} ->
-                    All = update_successors(Blk1, Bool, Test, MustInvert, Tests, All0),
-                    {_, Var1, Var2} = Test,
-                    Dst = Bool,
-                    #{
-                        new_test := #{
-                            dsts := TestByDst,
-                            dst_by_vars := DstByVars
-                        } = NewTests
-                    } = Acc,
-                    NewAcc = Acc#{
-                        new_test := NewTests#{
-                            % TODO VIB: test here is just for debug
-                            dsts := TestByDst#{Dst => Test},
-                            dst_by_vars := DstByVars#{{Var1, Var2} => Dst}
-                        }
-                    },
-                    categorize_tests(Ls, Blocks, All, NewAcc);
-                {retraversal, _Var1, _Var2, Test, Bool} ->
-                    {_, Var1, Var2} = Test,
-                    Dst = Bool,
-                    #{
-                        retraversal := #{
-                            test_by_dst := TestByDst,
-                            vars := Vars
-                        } = Retraversals
-                    } = Acc,
-                    NewAcc = Acc#{
-                        retraversal := Retraversals#{
-                            test_by_dst := TestByDst#{Dst => Test},
-                            vars := Vars#{{Var1, Var2} => none}
-                        }
-                    },
-                    categorize_tests(Ls, Blocks, All0, NewAcc)
-            end;
-        #{} ->
-            categorize_tests(Ls, Blocks, All0, Acc)
+categorize_tests(Ls, Blocks) ->
+    categorize_tests(Ls, Blocks, ?DEFAULT_CATEGORIZED_TESTS).
+categorize_tests([L|Ls], Blocks, Acc) ->
+    Blk0 = map_get(L, Blocks),
+    #b_blk{is=Is0} = Blk0,
+    case categorize_is(Is0, Acc, []) of
+        none ->
+            categorize_tests(Ls, Blocks, Acc);
+        {new_test, Dst, Test} ->
+            {_, Var1, Var2} = Test,
+            #{
+                new_test := #{
+                    dsts := TestByDst,
+                    dst_by_vars := DstByVars
+                } = NewTests
+            } = Acc,
+            NewAcc = Acc#{
+                new_test := NewTests#{
+                    % TODO VIB: test here is just for debug
+                    dsts := TestByDst#{Dst => Test},
+                    dst_by_vars := DstByVars#{{Var1, Var2} => Dst}
+                }
+            },
+            categorize_tests(Ls, Blocks, NewAcc);
+        {retraversal, Dst, Test} ->
+            {_, Var1, Var2} = Test,
+            #{
+                retraversal := #{
+                    test_by_dst := TestByDst,
+                    vars := Vars
+                } = Retraversals
+            } = Acc,
+            NewAcc = Acc#{
+                retraversal := Retraversals#{
+                    test_by_dst := TestByDst#{Dst => Test},
+                    vars := Vars#{{Var1, Var2} => none}
+                }
+            },
+            categorize_tests(Ls, Blocks, NewAcc)
     end;
-categorize_tests([], _Blocks, _All, Acc) -> Acc.
+categorize_tests([], _Blocks, Acc) -> Acc.
 
-
-categorize_is([#b_set{op=Op,args=Args,dst=Bool}], Tests, _Acc) ->
+categorize_is([#b_set{op=Op,args=Args,dst=Dst}], Categorized, _Acc) ->
     case arith_test(Op, Args) of
         none ->
             none;
-        {Test,MustInvert} ->
-            case retraversal(Test, Tests) of
-                {true, Var1, Var2, Test} ->
-                    {retraversal, Var1, Var2, Test, Bool};
-                false ->
-                    case new_test(Test) of
-                        true -> {new_test,Bool,Test,MustInvert};
-                        false -> none
-                    end
-            end
+        {Test,_MustInvert} ->
+            {categorize_test(Dst, Test, Categorized), Dst, Test}
     end;
-categorize_is([I|Is], Tests, Acc) ->
-    categorize_is(Is, Tests, [I|Acc]);
-categorize_is([], _Tests, _Acc) -> none.
+categorize_is([I|Is], Categorized, Acc) ->
+    categorize_is(Is, Categorized, [I|Acc]);
+categorize_is([], _Categorized, _Acc) -> none.
 
-new_test(Test) ->
-    case Test of
-        {'==', _, _} -> true;
-        {'=<', _, _} -> true;
-        {'<', _, _} -> true;
-        {'=:=', _, _} -> false;
-        %%% only tests with two vars are considered
-        _ -> false
-    end.
-
-lookup_parent(Test, Tests, Var1, Var2) ->
-    case Tests of
-        %% TODO VIB: We need Dst or something here as well to determine if it truly is self
-        %% parent
-        %% do not match self
-        #{Test := _} -> false;
-        %% not sure if this is exhaustive nor correct, e.g. =:= not included for now
-        #{{'==', Var1, Var2} := _} -> {true, Var1, Var2, Test};
-        #{{'=<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
-        #{{'<', Var1, Var2} := _} -> {true, Var1, Var2, Test};
-        _ -> false
-    end.
-
-retraversal(Test, Tests) ->
-    case Test of
-        % retraversal currently being considered
-        {'=:=', _Var1, _Var2} -> false;
-        {'==', Var1, Var2} -> lookup_parent(Test, Tests, Var1, Var2);
-        {'=<', Var1, Var2} -> lookup_parent(Test, Tests, Var1, Var2);
-        {'<', Var1, Var2} -> lookup_parent(Test, Tests, Var1, Var2);
-        %% not all tests have two vars and only those with two vars are considered
-        _ -> false
+categorize_test(_Dst, Test, Categorized) ->
+    #{
+        new_test := #{
+            dst_by_vars := NewTestDstByVars
+        }
+    } = Categorized,
+    {_, Var1, Var2} = Test,
+    VarsTraversed = maps:is_key({Var1, Var2}, NewTestDstByVars),
+    case VarsTraversed of
+        true -> retraversal;
+        false -> new_test
     end.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
