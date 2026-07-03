@@ -1274,7 +1274,7 @@ opt_test_traversals(Blocks) ->
     % TODO: if CategorizedTests is an empty map we can fast-path return
     % even better: skip if no retraversals
     CategorizedTests = categorize_tests(RPO, Blocks),
-    io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
+    %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
     Uses = beam_ssa:uses(RPO, Blocks),
     %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
     Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
@@ -1287,6 +1287,7 @@ var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
         #{Var:=[_|_]} -> false
     end.
 
+% Assumes -1,0,1 so no need to know anything about parent/retraversal
 create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) when is_boolean(MustInvert) ->
     Succ0 = case CanonicalOp of
         '<' -> [-1];
@@ -1309,11 +1310,15 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     #{
         new_test => #{
             dsts => #{},
-            dst_by_vars => #{}
+            ls => #{
+              % L => #{
+              %   dst_by_vars => #{}
+              % }
+            }
         },
         retraversal => #{
             test_by_dst => #{},
-            vars => #{}
+            parentDsts => #{}
         }
     }
 ).
@@ -1321,21 +1326,22 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
 opt_test_traversals(_Ls, Blocks, CategorizedTests, _Uses) when CategorizedTests =:= ?DEFAULT_CATEGORIZED_TESTS ->
     % TODO VIB: should actually be when retraversals is default
     % skip pass if no opportunities for optimization were found
-    io:format("skipped~n"),
+    %io:format("skipped~n"),
     beam_ssa:linearize(Blocks);
 opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
+    % TODO VIB: do like this on CategorizedTests instead of passing L
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    case opt_test_traversals_is(Is0, [], CategorizedTests) of
+    case opt_test_traversals_is(L, Is0, [], CategorizedTests) of
         {parent, Is, CanonicalOp, MustInvert} ->
             Blk = case Blk0 of
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           case var_single_use(BrVar, Uses) of
                               true ->
-                                  io:format("parent block before: ~n~p~n", [Blk0]),
+                                  io:format("parent block label ~p before: ~n~p~n", [L, Blk0]),
                                   Sw = create_switch(BrVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   After = Blk0#b_blk{is=Is,last=Sw},
-                                  io:format("parent block After: ~n~p~n", [After]),
+                                  io:format("parent block label ~p After: ~n~p~n", [L, After]),
                                   After;
                               false ->
                                   Blk0
@@ -1349,10 +1355,11 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
                           % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
                           case var_single_use(ParentVar, Uses) andalso var_single_use(BrVar, Uses) of
                               true ->
-                                  io:format("retraversal block before: ~n~p~n", [Blk0]),
+                                  io:format("retraversal block label ~p before: ~n~p~n", [L, Blk0]),
                                   Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   After = Blk0#b_blk{last=Sw},
-                                  io:format("retraversal block After: ~n~p~n", [After]),
+                                  io:format("retraversal block label ~p After: ~n~p~n", [L, After]),
+                                  io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
                                   After;
                               false -> Blk0
                           end;
@@ -1375,43 +1382,46 @@ arith_test(Op, Args) ->
         _ -> none
     end.
 
-optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) ->
+optimizeable_test_traversal(L, Op, Args, CategorizedTests, Dst) ->
     case arith_test(Op, Args) of
         none ->
             none;
         {Test, MustInvert} ->
+            {_, Var1, Var2} = Test,
+            Vars = {Var1, Var2},
             #{
                 new_test := #{
-                    dsts := NewTestDsts,
-                    dst_by_vars := NewTestDstByVars
+                    ls := #{
+                        L := #{
+                            dst_by_vars := NewTestDstByVars
+                        }
+                    }
                 },
                 retraversal := #{
                     test_by_dst := RetraversalByDst,
-                    vars := RetraversalVars
+                    parentDsts := ParentDsts
                 }
             } = CategorizedTests,
-            IsNewTest = maps:is_key(Dst, NewTestDsts),
+
+            IsParent = maps:is_key(Dst, ParentDsts),
             IsRetraversal = maps:is_key(Dst, RetraversalByDst),
-            {_, Var1, Var2} = Test,
-            RetraversalLater = maps:is_key({Var1, Var2}, RetraversalVars),
-            case {IsNewTest, IsRetraversal} of
+            case {IsParent, IsRetraversal} of
                 {false, false} -> none;
-                {true, false} when RetraversalLater ->
+                {true, false} ->
                     {parent, Var1, Var2, Test, MustInvert};
-                {true, false} -> none;
                 {false, true} ->
-                    ParentDst = maps:get({Var1, Var2}, NewTestDstByVars),
+                    ParentDst = maps:get(Vars, NewTestDstByVars),
                     {retraversal, ParentDst, Test, MustInvert}
                 %% Other cases should have been skipped
             end
     end.
 
-opt_test_traversals_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
-    case optimizeable_test_traversal(Op, Args, CategorizedTests, Dst) of
+opt_test_traversals_is(L, [#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
+    case optimizeable_test_traversal(L, Op, Args, CategorizedTests, Dst) of
         % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=lists}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
-            io:format("APPLYING OPTIMIATION, call: ~p~n", [I]),
+            io:format("APPLYING OPTIMIZATION, call: ~p~n", [I]),
             {CanonicalOp, _, _} = Test,
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
         {retraversal, ParentVar, Test, MustInvert} ->
@@ -1420,74 +1430,124 @@ opt_test_traversals_is([#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTes
         none ->
             none
     end;
-opt_test_traversals_is([I|Is], Acc, CategorizedTests) ->
-    opt_test_traversals_is(Is, [I|Acc], CategorizedTests);
-opt_test_traversals_is([], _Acc, _CategorizedTests) -> none.
+opt_test_traversals_is(L, [I|Is], Acc, CategorizedTests) ->
+    opt_test_traversals_is(L, Is, [I|Acc], CategorizedTests);
+opt_test_traversals_is(_L, [], _Acc, _CategorizedTests) -> none.
 
 categorize_tests(Ls, Blocks) ->
     categorize_tests(Ls, Blocks, ?DEFAULT_CATEGORIZED_TESTS).
 categorize_tests([L|Ls], Blocks, Acc) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
-    case categorize_is(Is0, Acc, []) of
+    case categorize_is(L, Is0, Acc, []) of
         none ->
             categorize_tests(Ls, Blocks, Acc);
-        {new_test, Dst, Test} ->
+        {{new_test, _}, Dst, Test} ->
             {_, Var1, Var2} = Test,
+            % #{
+            %   new_test => #{
+            %     % for IsNewTest (EDIT: Actually only for determining parentDsts?)
+            %     dsts => #{} ,
+            %     % ls (L) thing here
+            %     ls => {
+            %        % so retraversal can find dst
+            %        dst_by_vars => #{}
+            %     }
+            %   }
+            %
+            %   % retraversals can be identified by dst as usual
+            %   retraversal := #{
+            %       test_by_dst := TestByDst,
+            %
+            %       # for RetraversalLater, hmm will this work? No because it could be in a non-dominated block
+            %       vars := Vars
+            %
+            %       # RE: Maybe better to, when a retraversal is found here in categorize, to make note of parentdst
+            %       parentDsts => {}
+            %       # then check is, in new_test dsts and in parentDsts. I think that is MONEY!
+            %       # could even recategorize as we go buts lets see
+            %   } = Retraversals
+            %
+            % }
             #{
                 new_test := #{
                     dsts := TestByDst,
-                    dst_by_vars := DstByVars
+                    ls := NewLs
                 } = NewTests
             } = Acc,
+            NewTestDstByVarsAL = case NewLs of
+                #{L := #{dst_by_vars := NewTestDstByVars}} -> NewTestDstByVars;
+                #{} -> #{}
+            end,
+            % update self
+            UpdatedWithSelf =
+                    NewLs#{
+                        % TODO VIB: I think this breaks if L ever holds more than dst_by_vars
+                        L => #{
+                            dst_by_vars => NewTestDstByVarsAL#{{Var1, Var2} => Dst}
+                        }
+                    },
+            UpdatedNewLs = update_imm_successors(Blk0, #{dst_by_vars => #{{Var1, Var2} => Dst}}, UpdatedWithSelf),
             NewAcc = Acc#{
                 new_test := NewTests#{
                     % TODO VIB: test here is just for debug
                     dsts := TestByDst#{Dst => Test},
-                    dst_by_vars := DstByVars#{{Var1, Var2} => Dst}
+                    ls := UpdatedNewLs
                 }
             },
             categorize_tests(Ls, Blocks, NewAcc);
-        {retraversal, Dst, Test} ->
-            {_, Var1, Var2} = Test,
+        {{retraversal, ParentDst}, Dst, Test} ->
+            %{_, Var1, Var2} = Test,
             #{
                 retraversal := #{
                     test_by_dst := TestByDst,
-                    vars := Vars
+                    %vars := Vars
+                    parentDsts := ParentDsts
                 } = Retraversals
             } = Acc,
             NewAcc = Acc#{
                 retraversal := Retraversals#{
                     test_by_dst := TestByDst#{Dst => Test},
-                    vars := Vars#{{Var1, Var2} => none}
+                    %vars := Vars#{{Var1, Var2} => none}
+                    % 2026-06-03: true is just to put something, only used for maps:is_key
+                    parentDsts := ParentDsts#{ParentDst => true}
+
                 }
             },
             categorize_tests(Ls, Blocks, NewAcc)
     end;
 categorize_tests([], _Blocks, Acc) -> Acc.
 
-categorize_is([#b_set{op=Op,args=Args,dst=Dst}], Categorized, _Acc) ->
+update_imm_successors(Blk, Tests, All) ->
+    foldl(fun(L, A) ->
+                  update_successor(L, Tests, A)
+          end, All, beam_ssa:successors(Blk)).
+
+categorize_is(L, [#b_set{op=Op,args=Args,dst=Dst}], Categorized, _Acc) ->
     case arith_test(Op, Args) of
         none ->
             none;
         {Test,_MustInvert} ->
-            {categorize_test(Dst, Test, Categorized), Dst, Test}
+            {categorize_test(L, Dst, Test, Categorized), Dst, Test}
     end;
-categorize_is([I|Is], Categorized, Acc) ->
-    categorize_is(Is, Categorized, [I|Acc]);
-categorize_is([], _Categorized, _Acc) -> none.
+categorize_is(L, [I|Is], Categorized, Acc) ->
+    categorize_is(L, Is, Categorized, [I|Acc]);
+categorize_is(_L, [], _Categorized, _Acc) -> none.
 
-categorize_test(_Dst, Test, Categorized) ->
+categorize_test(L, _Dst, Test, Categorized) ->
     #{
         new_test := #{
-            dst_by_vars := NewTestDstByVars
+            ls := Ls
         }
     } = Categorized,
+    NewTestDstByVarsAL = case Ls of
+        #{L := #{dst_by_vars := NewTestDstByVars}} -> NewTestDstByVars;
+        #{} -> #{}
+    end,
     {_, Var1, Var2} = Test,
-    VarsTraversed = maps:is_key({Var1, Var2}, NewTestDstByVars),
-    case VarsTraversed of
-        true -> retraversal;
-        false -> new_test
+    case NewTestDstByVarsAL of
+        #{{Var1, Var2} := ParentDst} -> {retraversal, ParentDst};
+        #{} -> {new_test, noparent}
     end.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
