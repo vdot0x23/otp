@@ -1273,8 +1273,10 @@ opt_test_traversals(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
     % TODO: if CategorizedTests is an empty map we can fast-path return
     % even better: skip if no retraversals
-    CategorizedTests = categorize_tests(RPO, Blocks),
-    %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
+    {Doms, _} = beam_ssa:dominators(RPO, Blocks),
+    io:format("Doms: ~n~p~n", [Doms]),
+    CategorizedTests = categorize_tests(RPO, Blocks, Doms),
+    io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
     Uses = beam_ssa:uses(RPO, Blocks),
     %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
     Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
@@ -1434,15 +1436,15 @@ opt_test_traversals_is(L, [I|Is], Acc, CategorizedTests) ->
     opt_test_traversals_is(L, Is, [I|Acc], CategorizedTests);
 opt_test_traversals_is(_L, [], _Acc, _CategorizedTests) -> none.
 
-categorize_tests(Ls, Blocks) ->
-    categorize_tests(Ls, Blocks, ?DEFAULT_CATEGORIZED_TESTS).
-categorize_tests([L|Ls], Blocks, Acc) ->
+categorize_tests(Ls, Blocks, Doms) ->
+    categorize_tests(Ls, Blocks, Doms, ?DEFAULT_CATEGORIZED_TESTS).
+categorize_tests([L|Ls], Blocks, Doms, Acc) ->
     Blk0 = map_get(L, Blocks),
     #b_blk{is=Is0} = Blk0,
     case categorize_is(L, Is0, Acc, []) of
         none ->
-            categorize_tests(Ls, Blocks, Acc);
-        {{new_test, _}, Dst, Test} ->
+            categorize_tests(Ls, Blocks, Doms, Acc);
+        {{new_test, _, _}, Dst, Test} ->
             {_, Var1, Var2} = Test,
             % #{
             %   new_test => #{
@@ -1471,7 +1473,7 @@ categorize_tests([L|Ls], Blocks, Acc) ->
             % }
             #{
                 new_test := #{
-                    dsts := TestByDst,
+                    dsts := LByDst,
                     ls := NewLs
                 } = NewTests
             } = Acc,
@@ -1490,13 +1492,12 @@ categorize_tests([L|Ls], Blocks, Acc) ->
             UpdatedNewLs = update_imm_successors(Blk0, #{dst_by_vars => #{{Var1, Var2} => Dst}}, UpdatedWithSelf),
             NewAcc = Acc#{
                 new_test := NewTests#{
-                    % TODO VIB: test here is just for debug
-                    dsts := TestByDst#{Dst => Test},
+                    dsts := LByDst#{Dst => L},
                     ls := UpdatedNewLs
                 }
             },
-            categorize_tests(Ls, Blocks, NewAcc);
-        {{retraversal, ParentDst}, Dst, Test} ->
+            categorize_tests(Ls, Blocks, Doms, NewAcc);
+        {{retraversal, ParentDst, ParentL}, Dst, Test} ->
             %{_, Var1, Var2} = Test,
             #{
                 retraversal := #{
@@ -1505,18 +1506,33 @@ categorize_tests([L|Ls], Blocks, Acc) ->
                     parentDsts := ParentDsts
                 } = Retraversals
             } = Acc,
-            NewAcc = Acc#{
-                retraversal := Retraversals#{
-                    test_by_dst := TestByDst#{Dst => Test},
-                    %vars := Vars#{{Var1, Var2} => none}
-                    % 2026-06-03: true is just to put something, only used for maps:is_key
-                    parentDsts := ParentDsts#{ParentDst => true}
-
-                }
-            },
-            categorize_tests(Ls, Blocks, NewAcc)
+            %io:format("categorize_tests is_dominated_by: ~p~n", [is_dominated_by(Doms, ParentL, L)]),
+            NewAcc = case is_dominated_by(Doms, ParentL, L) of
+                true ->
+                    Acc#{
+                        retraversal := Retraversals#{
+                            test_by_dst := TestByDst#{Dst => Test},
+                            %vars := Vars#{{Var1, Var2} => none}
+                            % 2026-06-03: true is just to put something, only used for maps:is_key
+                            parentDsts := ParentDsts#{ParentDst => true}
+                        }
+                    };
+                    false -> Acc
+                end,
+            categorize_tests(Ls, Blocks, Doms, NewAcc)
     end;
-categorize_tests([], _Blocks, Acc) -> Acc.
+categorize_tests([], _Blocks, _Doms, Acc) -> Acc.
+
+is_dominated_by(Doms, Dominator, Dominee) ->
+    %io:format("is_dominated_by Doms: ~n~p~n", [Doms]),
+    %io:format("is_dominated_by Dominator: ~n~p~n", [Dominator]),
+    %io:format("is_dominated_by Dominee: ~n~p~n", [Dominee]),
+    case Doms of
+      #{Dominee := Dominators} ->
+          lists:member(Dominator, Dominators);
+      #{} -> false
+    end.
+
 
 update_imm_successors(Blk, Tests, All) ->
     foldl(fun(L, A) ->
@@ -1535,20 +1551,27 @@ categorize_is(L, [I|Is], Categorized, Acc) ->
 categorize_is(_L, [], _Categorized, _Acc) -> none.
 
 categorize_test(L, _Dst, Test, Categorized) ->
+    %io:format("categorize_test L: ~p~n", [L]),
+    %io:format("categorize_test Test: ~p~n", [Test]),
+    %io:format("categorize_test Categorized: ~p~n", [Categorized]),
     #{
         new_test := #{
-            ls := Ls
+            ls := Ls,
+            dsts := LByDsts
         }
     } = Categorized,
     NewTestDstByVarsAL = case Ls of
         #{L := #{dst_by_vars := NewTestDstByVars}} -> NewTestDstByVars;
         #{} -> #{}
     end,
+    %io:format("categorize_test NewTestDstByVarsAL : ~p~n", [NewTestDstByVarsAL]),
     {_, Var1, Var2} = Test,
-    case NewTestDstByVarsAL of
-        #{{Var1, Var2} := ParentDst} -> {retraversal, ParentDst};
-        #{} -> {new_test, noparent}
-    end.
+    Res = case NewTestDstByVarsAL of
+        #{{Var1, Var2} := ParentDst} -> {retraversal, ParentDst, maps:get(ParentDst, LByDsts)};
+        #{} -> {new_test, noparent, nol}
+    end,
+    %io:format("categorize_test Res : ~p~n", [Res]),
+    Res.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of
