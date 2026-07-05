@@ -1274,9 +1274,9 @@ opt_test_traversals(Blocks) ->
     % TODO: if CategorizedTests is an empty map we can fast-path return
     % even better: skip if no retraversals
     {Doms, _} = beam_ssa:dominators(RPO, Blocks),
-    io:format("Doms: ~n~p~n", [Doms]),
+    %io:format("Doms: ~n~p~n", [Doms]),
     CategorizedTests = categorize_tests(RPO, Blocks, Doms),
-    io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
+    %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
     Uses = beam_ssa:uses(RPO, Blocks),
     %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
     Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
@@ -1422,7 +1422,9 @@ opt_test_traversals_is(L, [#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Categorized
     case optimizeable_test_traversal(L, Op, Args, CategorizedTests, Dst) of
         % TODO: returning both vars and Test is redundant
         {parent, Var1, Var2, Test, MustInvert} ->
-            I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=lists}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
+            %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
+            %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=lists}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
+            I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
             io:format("APPLYING OPTIMIZATION, call: ~p~n", [I]),
             {CanonicalOp, _, _} = Test,
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};

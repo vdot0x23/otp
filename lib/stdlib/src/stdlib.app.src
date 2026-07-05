@@ -86,6 +86,7 @@
 	     maps,
 	     math,
 	     ms_transform,
+             mycmp,
 	     orddict,
 	     ordsets,
 	     otp_internal,
