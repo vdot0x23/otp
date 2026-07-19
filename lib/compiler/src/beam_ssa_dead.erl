@@ -28,6 +28,7 @@
 -module(beam_ssa_dead).
 -moduledoc false.
 -export([opt/1]).
+-compile(nowarn_unused_function).
 
 -include("beam_ssa.hrl").
 -import(lists, [append/1,foldl/3,keymember/3,last/1,member/2,
@@ -1249,39 +1250,109 @@ opt_redundant_tests(Blocks) ->
 %%%          { `0`, ^34 }
 %%%        ]
 %%%
-%%% This sub pass works in two passes:
-%%% The 1st pass keeps track of all tests that are known to have
-%%% been executed at each block in the SSA code and uses this to categorize
-%%% tests into a map of new tests (i.e. potential parents) and retraversals:
-%%%
-%%% #{new_test =>
-%%%      #{{b_var,27} => {'<',{b_var,2},{b_literal,{3,3}}},
-%%%        {b_var,31} => {'<',{b_var,2},{b_literal,{3,3}}}},
-%%%  retraversal => #{{b_var,19} => {'==',{b_var,2},{b_literal,{3,3}}}}}
-%%%
-%%% The 2nd pass determines which new tests are parents of a retraversal.
-%%% It replaces parent tests with erts_cmp and the br with a switch.
-%%% It also replaces the br of retraversal tests with a switch
-%%% on the result of erts_cmp from the parent.
 %%%
 %%% This optimization is only applied when the previously boolean variables
 %%% are single-use in br. In principle all uses of the previously boolean
 %%% variables could be adjusted to handle -1, 0, 1 (from erts_cmp) but
 %%% for the time being they are not.
 %%%
+%%% + post-dominates
+%%%
+
+build_tree(Doms) ->
+    TreeMap =
+        lists:foldl(
+          fun(Path, Acc) ->
+                  insert_node(lists:reverse(Path), Acc)
+          end,
+          #{},
+          Doms),
+    TreeMap.
+
+%% Insert one root->leaf path
+insert_node([], Tree) ->
+    Tree;
+insert_node([Node | Rest], Tree) ->
+    Children0 = maps:get(Node, Tree, #{}),
+    Children1 = insert_node(Rest, Children0),
+    Tree#{Node => Children1}.
+
 opt_test_traversals(Blocks) ->
     RPO = beam_ssa:rpo(Blocks),
-    % TODO: if CategorizedTests is an empty map we can fast-path return
-    % even better: skip if no retraversals
     {Doms, _} = beam_ssa:dominators(RPO, Blocks),
-    %io:format("Doms: ~n~p~n", [Doms]),
-    CategorizedTests = categorize_tests(RPO, Blocks, Doms),
-    %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
+    DomTree = build_tree(maps:values(Doms)),
     Uses = beam_ssa:uses(RPO, Blocks),
-    %io:format("Linear before: ~n~p~n", [beam_ssa:linearize(Blocks)]),
-    Linear = opt_test_traversals(RPO, Blocks, CategorizedTests, {uses, Uses}),
-    %io:format("Linear after: ~n~p~n", [Linear]),
-    beam_ssa:trim_unreachable(Linear).
+
+    io:format("Blocks: ~n~p~n", [Blocks]),
+    Linear = opt_new(DomTree, Blocks, Uses),
+    io:format("Linear after: ~n~p~n", [Linear]),
+    %beam_ssa:trim_unreachable(Linear).
+    beam_ssa:linearize(Blocks).
+
+opt_new(DomTree, Blocks, Uses) ->
+    traverse(Blocks, DomTree, Uses, undefined, #{}).
+
+
+
+
+traverse(Blocks, TreeMap, Uses, Parent, Acc) ->
+    maps:fold(
+      fun(Node, Children, Acc0) ->
+          Block = maps:get(Node, Blocks),
+          #b_blk{is=Is} = Block,
+          Catted = categorize_is2(Is, []),
+          % TODO consider optimization where node does not exist instead of #{}
+          ParentDstByVarss = maps:get(Parent, Acc, #{}),
+          Acc1 = case Catted of
+                     none -> Acc0#{Node => ParentDstByVarss};
+                     {Dst, {_, Var1, Var2}} ->
+                         case ParentDstByVarss of 
+                             #{{Var1, Var2} := ParentDst} ->
+                                 % TODO VIB:
+                                 % check single use in br
+                                 %   what if not single use in br?
+                                 %      parent not single use in br ->
+                                 %        use DstByVars only
+                                 %      child not single use in br ->
+                                 %        use ParentDstByVarss only
+                                 % modify blocks
+                                 % use ParentDstByVarss only
+                                 DstByVars = #{{Var1, Var2} => Dst},
+
+                                 NodeVal = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
+                                     {true, true} -> 
+                                         % TODO VIB: apply opt
+                                         io:format("TODO APPLY: ~p ~p~n", [ParentDst, Dst]),
+                                         ParentDstByVarss
+                                         ;
+                                     {true, false} -> ParentDstByVarss;
+                                     {false, true} -> DstByVars;
+                                     {false, false} -> #{}
+                                 end,
+                                 Acc0#{Node => NodeVal};
+                             _ ->
+                                 DstByVars = #{{Var1, Var2} => Dst},
+                                 % TODO VIB: maybe throw on merge
+                                 Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}
+                         end
+                 end,
+          traverse(Blocks, Children, Uses, Node, Acc1)
+      end,
+      Acc,
+      TreeMap).
+
+
+categorize_is2([#b_set{op=Op,args=Args,dst=Dst}], _Acc) ->
+    case arith_test(Op, Args) of
+        none ->
+            none;
+        {Test,_MustInvert} ->
+            {Dst, Test}
+    end;
+categorize_is2([I|Is], Acc) ->
+    categorize_is2(Is, [I|Acc]);
+categorize_is2([], _Acc) -> none.
+
 
 var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
     case Uses of
@@ -1340,10 +1411,10 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
                       #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
                           case var_single_use(BrVar, Uses) of
                               true ->
-                                  io:format("parent block label ~p before: ~n~p~n", [L, Blk0]),
+                                  %io:format("parent block label ~p before: ~n~p~n", [L, Blk0]),
                                   Sw = create_switch(BrVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   After = Blk0#b_blk{is=Is,last=Sw},
-                                  io:format("parent block label ~p After: ~n~p~n", [L, After]),
+                                  %io:format("parent block label ~p After: ~n~p~n", [L, After]),
                                   After;
                               false ->
                                   Blk0
@@ -1357,11 +1428,11 @@ opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
                           % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
                           case var_single_use(ParentVar, Uses) andalso var_single_use(BrVar, Uses) of
                               true ->
-                                  io:format("retraversal block label ~p before: ~n~p~n", [L, Blk0]),
+                                  %io:format("retraversal block label ~p before: ~n~p~n", [L, Blk0]),
                                   Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
                                   After = Blk0#b_blk{last=Sw},
-                                  io:format("retraversal block label ~p After: ~n~p~n", [L, After]),
-                                  io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
+                                  %io:format("retraversal block label ~p After: ~n~p~n", [L, After]),
+                                  %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
                                   After;
                               false -> Blk0
                           end;
@@ -1425,7 +1496,7 @@ opt_test_traversals_is(L, [#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, Categorized
             %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
             %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=lists}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
             I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
-            io:format("APPLYING OPTIMIZATION, call: ~p~n", [I]),
+            %io:format("APPLYING OPTIMIZATION, call: ~p~n", [I]),
             {CanonicalOp, _, _} = Test,
             {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
         {retraversal, ParentVar, Test, MustInvert} ->
