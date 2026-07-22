@@ -1283,31 +1283,31 @@ opt_test_traversals(Blocks) ->
     DomTree = build_tree(maps:values(Doms)),
     Uses = beam_ssa:uses(RPO, Blocks),
 
-    io:format("Blocks: ~n~p~n", [Blocks]),
-    Linear = opt_new(DomTree, Blocks, Uses),
-    io:format("Linear after: ~n~p~n", [Linear]),
-    %beam_ssa:trim_unreachable(Linear).
-    beam_ssa:linearize(Blocks).
+    %io:format("Blocks: ~n~p~n", [Blocks]),
+    {_, NewBlocks} = opt_new(DomTree, Blocks, Uses),
+    %io:format("Linear after: ~n~p~n", [Linear]),
+    Linear = beam_ssa:linearize(NewBlocks),
+    beam_ssa:trim_unreachable(Linear).
 
 opt_new(DomTree, Blocks, Uses) ->
-    traverse(Blocks, DomTree, Uses, undefined, #{}).
+    traverse(DomTree, Uses, undefined, {#{}, Blocks}).
 
 
 
 
-traverse(Blocks, TreeMap, Uses, Parent, Acc) ->
+traverse(TreeMap, Uses, Parent, Acc) ->
     maps:fold(
-      fun(Node, Children, Acc0) ->
+      fun(Node, Children, {Acc0, Blocks}) ->
           Block = maps:get(Node, Blocks),
           #b_blk{is=Is} = Block,
           Catted = categorize_is2(Is, []),
           % TODO consider optimization where node does not exist instead of #{}
-          ParentDstByVarss = maps:get(Parent, Acc, #{}),
-          Acc1 = case Catted of
-                     none -> Acc0#{Node => ParentDstByVarss};
-                     {Dst, {_, Var1, Var2}} ->
+          ParentDstByVarss = maps:get(Parent, Acc0, #{}),
+          {Acc1, Blocks1} = case Catted of
+                     none -> {Acc0#{Node => ParentDstByVarss}, Blocks};
+                     {Dst, {CanonicalOp, Var1, Var2}, MustInvert} ->
                          case ParentDstByVarss of 
-                             #{{Var1, Var2} := ParentDst} ->
+                             #{{Var1, Var2} := {ParentDst, ParentL, ParentMustInvert, ParentCanonicalOp}} ->
                                  % TODO VIB:
                                  % check single use in br
                                  %   what if not single use in br?
@@ -1317,37 +1317,63 @@ traverse(Blocks, TreeMap, Uses, Parent, Acc) ->
                                  %        use ParentDstByVarss only
                                  % modify blocks
                                  % use ParentDstByVarss only
-                                 DstByVars = #{{Var1, Var2} => Dst},
+                                 DstByVars = #{{Var1, Var2} => {Dst, Node}},
 
-                                 NodeVal = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
+                                 {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
                                      {true, true} -> 
-                                         % TODO VIB: apply opt
-                                         io:format("TODO APPLY: ~p ~p~n", [ParentDst, Dst]),
-                                         ParentDstByVarss
+                                         io:format("APPLYING~n"),
+                                         %io:format("TODO APPLY: ~p ~p ~p~n", [ParentDst, Dst, ParentL]),
+                                         %io:format("Acc:~p~n", [Acc]),
+                                         % TODO VIB: apply opt to blocks instead of return hardcoded
+                                         
+                                         % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
+                                         BlocksP = maps:update_with(ParentL, fun(V) -> change_parent(V, ParentMustInvert, ParentCanonicalOp, Var1, Var2) end, Blocks),
+                                         BlocksC = maps:update_with(Node, fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end, BlocksP),
+
+                                         {ParentDstByVarss, BlocksC}
                                          ;
-                                     {true, false} -> ParentDstByVarss;
-                                     {false, true} -> DstByVars;
-                                     {false, false} -> #{}
+                                     {true, false} -> {ParentDstByVarss, Blocks};
+                                     {false, true} -> {DstByVars, Blocks};
+                                     {false, false} -> {#{}, Blocks}
                                  end,
-                                 Acc0#{Node => NodeVal};
+                                 {Acc0#{Node => NodeVal}, BlocksCool};
                              _ ->
-                                 DstByVars = #{{Var1, Var2} => Dst},
+                                 DstByVars = #{{Var1, Var2} => {Dst, Node, MustInvert, CanonicalOp}},
                                  % TODO VIB: maybe throw on merge
-                                 Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}
+                                 {Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}, Blocks}
                          end
                  end,
-          traverse(Blocks, Children, Uses, Node, Acc1)
+          traverse(Children, Uses, Node, {Acc1, Blocks1})
       end,
       Acc,
       TreeMap).
 
+change_parent(Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
+    #b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0,
+    Blk1 = change_retrav(Blk0, BrVar, CanonicalOp, MustInvert),
+    #b_blk{is=Is1} = Blk1,
+    % always the last ins since categorize_is2 only looks at the last ins
+    [I0 | Rest] = reverse(Is1),
+    I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
+    Done = reverse(Rest, [I]),
+    After = Blk1#b_blk{is=Done},
+    After.
 
+change_retrav(Blk0, ParentVar, CanonicalOp, MustInvert) ->
+    #b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0,
+    Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
+    Blk0#b_blk{last=Sw}.
+
+ 
+    % TODO VIB: does this just find the first test? Can't there be multiple tests?
+    % TODO VIB: I should return an index here so we can find which ins to modify. Actually maybe not since sometimes multiple insns in block need to modyfied
+    % TODO VIB: this only looks at the last b_set in the ins list, is that correct / good enough?
 categorize_is2([#b_set{op=Op,args=Args,dst=Dst}], _Acc) ->
     case arith_test(Op, Args) of
         none ->
             none;
-        {Test,_MustInvert} ->
-            {Dst, Test}
+        {Test, MustInvert} ->
+            {Dst, Test, MustInvert}
     end;
 categorize_is2([I|Is], Acc) ->
     categorize_is2(Is, [I|Acc]);
