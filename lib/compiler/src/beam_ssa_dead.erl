@@ -1321,7 +1321,6 @@ traverse(TreeMap, Uses, Parent, Acc) ->
 
                                  {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
                                      {true, true} -> 
-                                         io:format("APPLYING~n"),
                                          %io:format("TODO APPLY: ~p ~p ~p~n", [ParentDst, Dst, ParentL]),
                                          %io:format("Acc:~p~n", [Acc]),
                                          % TODO VIB: apply opt to blocks instead of return hardcoded
@@ -1348,21 +1347,29 @@ traverse(TreeMap, Uses, Parent, Acc) ->
       Acc,
       TreeMap).
 
-change_parent(Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
-    #b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0,
+change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
+    io:format("APPLYINGP~n"),
     Blk1 = change_retrav(Blk0, BrVar, CanonicalOp, MustInvert),
     #b_blk{is=Is1} = Blk1,
     % always the last ins since categorize_is2 only looks at the last ins
     [I0 | Rest] = reverse(Is1),
-    I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
+    I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
+    %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
     Done = reverse(Rest, [I]),
     After = Blk1#b_blk{is=Done},
-    After.
+    After;
+change_parent(#b_blk{} = Blk0, _A, _B, _C, _D) ->
+    % most common case (from diffable) is already changed, so b_switch
+    Blk0.
 
-change_retrav(Blk0, ParentVar, CanonicalOp, MustInvert) ->
-    #b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0,
+change_retrav(#b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0, ParentVar, CanonicalOp, MustInvert) ->
     Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
-    Blk0#b_blk{last=Sw}.
+    Blk0#b_blk{last=Sw};
+change_retrav(#b_blk{} = Blk0, _ParentVar, _CanonicalOp, _MustInvert) ->
+    % most common case (from diffable) is 
+    % {b_ret,#{result_type => {t_atom,[false,true]}},{b_var,11}}}
+    % TODO VIB: I can probably cover this case in the optimization (by replacing the prev b_set)
+    Blk0.
 
  
     % TODO VIB: does this just find the first test? Can't there be multiple tests?
