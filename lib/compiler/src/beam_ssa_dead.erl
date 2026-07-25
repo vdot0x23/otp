@@ -1282,67 +1282,67 @@ opt_test_traversals(Blocks) ->
     {Doms, _} = beam_ssa:dominators(RPO, Blocks),
     DomTree = build_tree(maps:values(Doms)),
     Uses = beam_ssa:uses(RPO, Blocks),
-
-    %io:format("Blocks: ~n~p~n", [Blocks]),
     {_, NewBlocks} = opt_new(DomTree, Blocks, Uses),
-    %io:format("Linear after: ~n~p~n", [Linear]),
     Linear = beam_ssa:linearize(NewBlocks),
     beam_ssa:trim_unreachable(Linear).
 
 opt_new(DomTree, Blocks, Uses) ->
     traverse(DomTree, Uses, undefined, {#{}, Blocks}).
 
-
-
-
 traverse(TreeMap, Uses, Parent, Acc) ->
     maps:fold(
-      fun(Node, Children, {Acc0, Blocks}) ->
-          Block = maps:get(Node, Blocks),
-          #b_blk{is=Is} = Block,
-          Catted = categorize_is2(Is, []),
-          % TODO consider optimization where node does not exist instead of #{}
-          ParentDstByVarss = maps:get(Parent, Acc0, #{}),
-          {Acc1, Blocks1} = case Catted of
-                     none -> {Acc0#{Node => ParentDstByVarss}, Blocks};
-                     {Dst, {CanonicalOp, Var1, Var2}, MustInvert} ->
-                         case ParentDstByVarss of 
-                             #{{Var1, Var2} := {ParentDst, ParentL, ParentMustInvert, ParentCanonicalOp}} ->
-                                 DstByVars = #{{Var1, Var2} => {Dst, Node}},
-
-                                 {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
-                                     {true, true} -> 
-% TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
-                                         BlocksP = maps:update_with(ParentL, fun(V) -> change_parent(V, ParentMustInvert, ParentCanonicalOp, Var1, Var2) end, Blocks),
-                                         BlocksC = maps:update_with(Node, fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end, BlocksP),
-
-                                         % no need to update parent if child not matched func head
-                                         BlocksD = case BlocksC =/= BlocksP of
-                                                       true ->
-                                                           io:format("AAPPLIED~n"),
-                                                           BlocksC;
-                                                       false ->
-                                                           io:format("NNOTAPPLIED~n"),
-                                                           Blocks
-                                                   end,
-                                         {ParentDstByVarss, BlocksD}
-                                         ;
-                                     {true, false} -> {ParentDstByVarss, Blocks};
-                                     {false, true} -> {DstByVars, Blocks};
-                                     {false, false} -> {#{}, Blocks}
-                                 end,
-                                 {Acc0#{Node => NodeVal}, BlocksCool};
-                             _ ->
-                                 DstByVars = #{{Var1, Var2} => {Dst, Node, MustInvert, CanonicalOp}},
-                                 % TODO VIB: maybe throw on merge
-                                 {Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}, Blocks}
-                         end
-                 end,
-          traverse(Children, Uses, Node, {Acc1, Blocks1})
+      fun(Node, Children, Acc0) ->
+          Acc1 = process_blocks(Node, Parent, Uses, Acc0),
+          traverse(Children, Uses, Node, Acc1)
       end,
       Acc,
       TreeMap).
 
+process_blocks(Node, Parent, Uses, {Acc0, Blocks}) ->
+    Block = maps:get(Node, Blocks),
+    #b_blk{is=Is} = Block,
+    Catted = categorize_is2(Is, []),
+    % TODO consider optimization where node does not exist instead of #{}
+    ParentDstByVarss = maps:get(Parent, Acc0, #{}),
+    case Catted of
+        none ->
+            {Acc0#{Node => ParentDstByVarss}, Blocks};
+        {Dst, {CanonicalOp, Var1, Var2}, MustInvert} ->
+            process_catted(ParentDstByVarss, Var1, Var2, Dst, Node, CanonicalOp, MustInvert, Uses, Blocks, Acc0)
+    end.
+
+process_catted(ParentDstByVarss, Var1, Var2, Dst, Node, CanonicalOp, MustInvert, Uses, Blocks, Acc0) ->
+    case ParentDstByVarss of 
+        #{{Var1, Var2} := {ParentDst, ParentL, ParentMustInvert, ParentCanonicalOp}} ->
+            DstByVars = #{{Var1, Var2} => {Dst, Node}},
+
+            {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
+                                        {true, true} -> 
+                                            % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
+                                            BlocksP = maps:update_with(ParentL, fun(V) -> change_parent(V, ParentMustInvert, ParentCanonicalOp, Var1, Var2) end, Blocks),
+                                            BlocksC = maps:update_with(Node, fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end, BlocksP),
+
+                                            % no need to update parent if child not matched func head
+                                            BlocksD = case BlocksC =/= BlocksP of
+                                                          true ->
+                                                              io:format("AAPPLIED~n"),
+                                                              BlocksC;
+                                                          false ->
+                                                              io:format("NNOTAPPLIED~n"),
+                                                              Blocks
+                                                      end,
+                                            {ParentDstByVarss, BlocksD}
+                                            ;
+                                        {true, false} -> {ParentDstByVarss, Blocks};
+                                        {false, true} -> {DstByVars, Blocks};
+                                        {false, false} -> {#{}, Blocks}
+                                    end,
+            {Acc0#{Node => NodeVal}, BlocksCool};
+        _ ->
+            DstByVars = #{{Var1, Var2} => {Dst, Node, MustInvert, CanonicalOp}},
+            % TODO VIB: maybe throw on merge
+            {Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}, Blocks}
+    end.
 
 
 change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
@@ -1409,70 +1409,6 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     SwTable = lists:merge(SuccTable, FailTable),
     beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
 
--define(DEFAULT_CATEGORIZED_TESTS,
-    #{
-        new_test => #{
-            dsts => #{},
-            ls => #{
-              % L => #{
-              %   dst_by_vars => #{}
-              % }
-            }
-        },
-        retraversal => #{
-            test_by_dst => #{},
-            parentDsts => #{}
-        }
-    }
-).
-
-opt_test_traversals(_Ls, Blocks, CategorizedTests, _Uses) when CategorizedTests =:= ?DEFAULT_CATEGORIZED_TESTS ->
-    % TODO VIB: should actually be when retraversals is default
-    % skip pass if no opportunities for optimization were found
-    %io:format("skipped~n"),
-    beam_ssa:linearize(Blocks);
-opt_test_traversals([L|Ls], Blocks, CategorizedTests, Uses) ->
-    % TODO VIB: do like this on CategorizedTests instead of passing L
-    Blk0 = map_get(L, Blocks),
-    #b_blk{is=Is0} = Blk0,
-    case opt_test_traversals_is(L, Is0, [], CategorizedTests) of
-        {parent, Is, CanonicalOp, MustInvert} ->
-            Blk = case Blk0 of
-                      #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          case var_single_use(BrVar, Uses) of
-                              true ->
-                                  %io:format("parent block label ~p before: ~n~p~n", [L, Blk0]),
-                                  Sw = create_switch(BrVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
-                                  After = Blk0#b_blk{is=Is,last=Sw},
-                                  %io:format("parent block label ~p After: ~n~p~n", [L, After]),
-                                  After;
-                              false ->
-                                  Blk0
-                          end;
-                      #b_blk{} -> Blk0
-                  end,
-            [{L, Blk}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)];
-        {retraversal, ParentVar, CanonicalOp, MustInvert} ->
-            Blk = case Blk0 of
-                      #b_blk{last=#b_br{bool=BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} ->
-                          % check single-use in br of both BrVar and parent, otherwise change was not applied to parent
-                          case var_single_use(ParentVar, Uses) andalso var_single_use(BrVar, Uses) of
-                              true ->
-                                  %io:format("retraversal block label ~p before: ~n~p~n", [L, Blk0]),
-                                  Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
-                                  After = Blk0#b_blk{last=Sw},
-                                  %io:format("retraversal block label ~p After: ~n~p~n", [L, After]),
-                                  %io:format("CategorizedTests: ~n~p~n", [CategorizedTests]),
-                                  After;
-                              false -> Blk0
-                          end;
-                      #b_blk{} -> Blk0
-                  end,
-            [{L, Blk}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)];
-        none ->
-            [{L, Blk0}|opt_test_traversals(Ls, Blocks, CategorizedTests, Uses)]
-    end;
-opt_test_traversals([], _Blocks, _CategorizedTests, _Uses) -> [].
 
 arith_test(Op, Args) ->
     CanonicalTest = canonical_test(Op, Args),
@@ -1485,196 +1421,6 @@ arith_test(Op, Args) ->
         _ -> none
     end.
 
-optimizeable_test_traversal(L, Op, Args, CategorizedTests, Dst) ->
-    case arith_test(Op, Args) of
-        none ->
-            none;
-        {Test, MustInvert} ->
-            {_, Var1, Var2} = Test,
-            Vars = {Var1, Var2},
-            #{
-                new_test := #{
-                    ls := #{
-                        L := #{
-                            dst_by_vars := NewTestDstByVars
-                        }
-                    }
-                },
-                retraversal := #{
-                    test_by_dst := RetraversalByDst,
-                    parentDsts := ParentDsts
-                }
-            } = CategorizedTests,
-
-            IsParent = maps:is_key(Dst, ParentDsts),
-            IsRetraversal = maps:is_key(Dst, RetraversalByDst),
-            case {IsParent, IsRetraversal} of
-                {false, false} -> none;
-                {true, false} ->
-                    {parent, Var1, Var2, Test, MustInvert};
-                {false, true} ->
-                    ParentDst = maps:get(Vars, NewTestDstByVars),
-                    {retraversal, ParentDst, Test, MustInvert}
-                %% Other cases should have been skipped
-            end
-    end.
-
-opt_test_traversals_is(L, [#b_set{op=Op,args=Args,dst=Dst}=I0], Acc, CategorizedTests) ->
-    case optimizeable_test_traversal(L, Op, Args, CategorizedTests, Dst) of
-        % TODO: returning both vars and Test is redundant
-        {parent, Var1, Var2, Test, MustInvert} ->
-            %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
-            %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=lists}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
-            I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
-            %io:format("APPLYING OPTIMIZATION, call: ~p~n", [I]),
-            {CanonicalOp, _, _} = Test,
-            {parent,reverse(Acc, [I]), CanonicalOp, MustInvert};
-        {retraversal, ParentVar, Test, MustInvert} ->
-            {CanonicalOp, _, _} = Test,
-            {retraversal, ParentVar, CanonicalOp, MustInvert};
-        none ->
-            none
-    end;
-opt_test_traversals_is(L, [I|Is], Acc, CategorizedTests) ->
-    opt_test_traversals_is(L, Is, [I|Acc], CategorizedTests);
-opt_test_traversals_is(_L, [], _Acc, _CategorizedTests) -> none.
-
-categorize_tests(Ls, Blocks, Doms) ->
-    categorize_tests(Ls, Blocks, Doms, ?DEFAULT_CATEGORIZED_TESTS).
-categorize_tests([L|Ls], Blocks, Doms, Acc) ->
-    Blk0 = map_get(L, Blocks),
-    #b_blk{is=Is0} = Blk0,
-    case categorize_is(L, Is0, Acc, []) of
-        none ->
-            categorize_tests(Ls, Blocks, Doms, Acc);
-        {{new_test, _, _}, Dst, Test} ->
-            {_, Var1, Var2} = Test,
-            % #{
-            %   new_test => #{
-            %     % for IsNewTest (EDIT: Actually only for determining parentDsts?)
-            %     dsts => #{} ,
-            %     % ls (L) thing here
-            %     ls => {
-            %        % so retraversal can find dst
-            %        dst_by_vars => #{}
-            %     }
-            %   }
-            %
-            %   % retraversals can be identified by dst as usual
-            %   retraversal := #{
-            %       test_by_dst := TestByDst,
-            %
-            %       # for RetraversalLater, hmm will this work? No because it could be in a non-dominated block
-            %       vars := Vars
-            %
-            %       # RE: Maybe better to, when a retraversal is found here in categorize, to make note of parentdst
-            %       parentDsts => {}
-            %       # then check is, in new_test dsts and in parentDsts. I think that is MONEY!
-            %       # could even recategorize as we go buts lets see
-            %   } = Retraversals
-            %
-            % }
-            #{
-                new_test := #{
-                    dsts := LByDst,
-                    ls := NewLs
-                } = NewTests
-            } = Acc,
-            NewTestDstByVarsAL = case NewLs of
-                #{L := #{dst_by_vars := NewTestDstByVars}} -> NewTestDstByVars;
-                #{} -> #{}
-            end,
-            % update self
-            UpdatedWithSelf =
-                    NewLs#{
-                        % TODO VIB: I think this breaks if L ever holds more than dst_by_vars
-                        L => #{
-                            dst_by_vars => NewTestDstByVarsAL#{{Var1, Var2} => Dst}
-                        }
-                    },
-            UpdatedNewLs = update_imm_successors(Blk0, #{dst_by_vars => #{{Var1, Var2} => Dst}}, UpdatedWithSelf),
-            NewAcc = Acc#{
-                new_test := NewTests#{
-                    dsts := LByDst#{Dst => L},
-                    ls := UpdatedNewLs
-                }
-            },
-            categorize_tests(Ls, Blocks, Doms, NewAcc);
-        {{retraversal, ParentDst, ParentL}, Dst, Test} ->
-            %{_, Var1, Var2} = Test,
-            #{
-                retraversal := #{
-                    test_by_dst := TestByDst,
-                    %vars := Vars
-                    parentDsts := ParentDsts
-                } = Retraversals
-            } = Acc,
-            %io:format("categorize_tests is_dominated_by: ~p~n", [is_dominated_by(Doms, ParentL, L)]),
-            NewAcc = case is_dominated_by(Doms, ParentL, L) of
-                true ->
-                    Acc#{
-                        retraversal := Retraversals#{
-                            test_by_dst := TestByDst#{Dst => Test},
-                            %vars := Vars#{{Var1, Var2} => none}
-                            % 2026-06-03: true is just to put something, only used for maps:is_key
-                            parentDsts := ParentDsts#{ParentDst => true}
-                        }
-                    };
-                    false -> Acc
-                end,
-            categorize_tests(Ls, Blocks, Doms, NewAcc)
-    end;
-categorize_tests([], _Blocks, _Doms, Acc) -> Acc.
-
-is_dominated_by(Doms, Dominator, Dominee) ->
-    %io:format("is_dominated_by Doms: ~n~p~n", [Doms]),
-    %io:format("is_dominated_by Dominator: ~n~p~n", [Dominator]),
-    %io:format("is_dominated_by Dominee: ~n~p~n", [Dominee]),
-    case Doms of
-      #{Dominee := Dominators} ->
-          lists:member(Dominator, Dominators);
-      #{} -> false
-    end.
-
-
-update_imm_successors(Blk, Tests, All) ->
-    foldl(fun(L, A) ->
-                  update_successor(L, Tests, A)
-          end, All, beam_ssa:successors(Blk)).
-
-categorize_is(L, [#b_set{op=Op,args=Args,dst=Dst}], Categorized, _Acc) ->
-    case arith_test(Op, Args) of
-        none ->
-            none;
-        {Test,_MustInvert} ->
-            {categorize_test(L, Dst, Test, Categorized), Dst, Test}
-    end;
-categorize_is(L, [I|Is], Categorized, Acc) ->
-    categorize_is(L, Is, Categorized, [I|Acc]);
-categorize_is(_L, [], _Categorized, _Acc) -> none.
-
-categorize_test(L, _Dst, Test, Categorized) ->
-    %io:format("categorize_test L: ~p~n", [L]),
-    %io:format("categorize_test Test: ~p~n", [Test]),
-    %io:format("categorize_test Categorized: ~p~n", [Categorized]),
-    #{
-        new_test := #{
-            ls := Ls,
-            dsts := LByDsts
-        }
-    } = Categorized,
-    NewTestDstByVarsAL = case Ls of
-        #{L := #{dst_by_vars := NewTestDstByVars}} -> NewTestDstByVars;
-        #{} -> #{}
-    end,
-    %io:format("categorize_test NewTestDstByVarsAL : ~p~n", [NewTestDstByVarsAL]),
-    {_, Var1, Var2} = Test,
-    Res = case NewTestDstByVarsAL of
-        #{{Var1, Var2} := ParentDst} -> {retraversal, ParentDst, maps:get(ParentDst, LByDsts)};
-        #{} -> {new_test, noparent, nol}
-    end,
-    %io:format("categorize_test Res : ~p~n", [Res]),
-    Res.
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of
