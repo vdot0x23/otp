@@ -1308,28 +1308,24 @@ traverse(TreeMap, Uses, Parent, Acc) ->
                      {Dst, {CanonicalOp, Var1, Var2}, MustInvert} ->
                          case ParentDstByVarss of 
                              #{{Var1, Var2} := {ParentDst, ParentL, ParentMustInvert, ParentCanonicalOp}} ->
-                                 % TODO VIB:
-                                 % check single use in br
-                                 %   what if not single use in br?
-                                 %      parent not single use in br ->
-                                 %        use DstByVars only
-                                 %      child not single use in br ->
-                                 %        use ParentDstByVarss only
-                                 % modify blocks
-                                 % use ParentDstByVarss only
                                  DstByVars = #{{Var1, Var2} => {Dst, Node}},
 
                                  {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
                                      {true, true} -> 
-                                         %io:format("TODO APPLY: ~p ~p ~p~n", [ParentDst, Dst, ParentL]),
-                                         %io:format("Acc:~p~n", [Acc]),
-                                         % TODO VIB: apply opt to blocks instead of return hardcoded
-                                         
-                                         % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
+% TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
                                          BlocksP = maps:update_with(ParentL, fun(V) -> change_parent(V, ParentMustInvert, ParentCanonicalOp, Var1, Var2) end, Blocks),
                                          BlocksC = maps:update_with(Node, fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end, BlocksP),
 
-                                         {ParentDstByVarss, BlocksC}
+                                         % no need to update parent if child not matched func head
+                                         BlocksD = case BlocksC =/= BlocksP of
+                                                       true ->
+                                                           io:format("AAPPLIED~n"),
+                                                           BlocksC;
+                                                       false ->
+                                                           io:format("NNOTAPPLIED~n"),
+                                                           Blocks
+                                                   end,
+                                         {ParentDstByVarss, BlocksD}
                                          ;
                                      {true, false} -> {ParentDstByVarss, Blocks};
                                      {false, true} -> {DstByVars, Blocks};
@@ -1347,8 +1343,9 @@ traverse(TreeMap, Uses, Parent, Acc) ->
       Acc,
       TreeMap).
 
+
+
 change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
-    io:format("APPLYINGP~n"),
     Blk1 = change_retrav(Blk0, BrVar, CanonicalOp, MustInvert),
     #b_blk{is=Is1} = Blk1,
     % always the last ins since categorize_is2 only looks at the last ins
