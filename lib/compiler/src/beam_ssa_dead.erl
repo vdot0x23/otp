@@ -28,7 +28,6 @@
 -module(beam_ssa_dead).
 -moduledoc false.
 -export([opt/1]).
--compile(nowarn_unused_function).
 
 -include("beam_ssa.hrl").
 -import(lists, [append/1,foldl/3,keymember/3,last/1,member/2,
@@ -1207,9 +1206,10 @@ opt_redundant_tests(Blocks) ->
     beam_ssa:trim_unreachable(Linear).
 
 %%%
-%%% Replace consecutive tests with a call to erts_internal:cmp_term.
+%%% Replace consecutive tests with a call to erts_internal:cmp_term
+%%% and reuse the result from that call.
 %%%
-%%% Consecutive tests are present in idiomatic Erlang code such as:
+%%% Consecutive tests such as:
 %%%
 %%%     case L of
 %%%	       [] -> ...;
@@ -1255,107 +1255,102 @@ opt_redundant_tests(Blocks) ->
 %%% are single-use in br. In principle all uses of the previously boolean
 %%% variables could be adjusted to handle -1, 0, 1 (from erts_cmp) but
 %%% for the time being they are not.
+%%% Additionally, the parent must dominate the retraversal
+%%% (i.e. erts_internal:cmp_term must have been executed to reuse its result).
 %%%
-%%% + post-dominates
-%%%
-
-build_tree(Doms) ->
-    TreeMap =
-        lists:foldl(
-          fun(Path, Acc) ->
-                  insert_node(lists:reverse(Path), Acc)
-          end,
-          #{},
-          Doms),
-    TreeMap.
-
-%% Insert one root->leaf path
-insert_node([], Tree) ->
-    Tree;
-insert_node([Node | Rest], Tree) ->
-    Children0 = maps:get(Node, Tree, #{}),
-    Children1 = insert_node(Rest, Children0),
-    Tree#{Node => Children1}.
-
-opt_test_traversals(Blocks) ->
-    RPO = beam_ssa:rpo(Blocks),
-    {Doms, _} = beam_ssa:dominators(RPO, Blocks),
-    DomTree = build_tree(maps:values(Doms)),
-    Uses = beam_ssa:uses(RPO, Blocks),
-    {_, NewBlocks} = opt_new(DomTree, Blocks, Uses),
-    Linear = beam_ssa:linearize(NewBlocks),
+opt_test_traversals(Blocks0) ->
+    RPO = beam_ssa:rpo(Blocks0),
+    Uses = beam_ssa:uses(RPO, Blocks0),
+    {Doms, _} = beam_ssa:dominators(RPO, Blocks0),
+    DomTree = build_dominator_tree(maps:values(Doms)),
+    Blocks = opt_test_traversals(DomTree, Blocks0, Uses),
+    Linear = beam_ssa:linearize(Blocks),
     beam_ssa:trim_unreachable(Linear).
 
-opt_new(DomTree, Blocks, Uses) ->
-    traverse(DomTree, Uses, undefined, {#{}, Blocks}).
+build_dominator_tree(Paths) ->
+    foldl(fun (Path, Acc) -> insert_dominator_node(reverse(Path), Acc) end, #{}, Paths).
 
-traverse(TreeMap, Uses, Parent, Acc) ->
+insert_dominator_node([], Tree) ->
+    Tree;
+insert_dominator_node([Node | Rest], Tree) ->
+    Children = maps:get(Node, Tree, #{}),
+    SubTree = insert_dominator_node(Rest, Children),
+    Tree#{Node => SubTree}.
+
+opt_test_traversals(DomTree, Blocks0, Uses) ->
+    {_, Blocks} = opt_test_traversals(DomTree, Uses, undefined, {#{}, Blocks0}),
+    Blocks.
+opt_test_traversals(DomTree, Uses, Parent, State0) ->
     maps:fold(
-      fun(Node, Children, Acc0) ->
-          Acc1 = process_blocks(Node, Parent, Uses, Acc0),
-          traverse(Children, Uses, Node, Acc1)
+      fun(Node, Children, State1) ->
+              State = opt_test_traversals_block(Node, Parent, Uses, State1),
+              opt_test_traversals(Children, Uses, Node, State)
       end,
-      Acc,
-      TreeMap).
-
-process_blocks(Node, Parent, Uses, {Acc0, Blocks}) ->
+      State0,
+      DomTree).
+    
+opt_test_traversals_block(Node, Parent, Uses, {DomTests, Blocks}) ->
     Block = maps:get(Node, Blocks),
     #b_blk{is=Is} = Block,
-    Catted = categorize_is2(Is, []),
-    % TODO consider optimization where node does not exist instead of #{}
-    ParentDstByVarss = maps:get(Parent, Acc0, #{}),
-    case Catted of
-        none ->
-            {Acc0#{Node => ParentDstByVarss}, Blocks};
-        {Dst, {CanonicalOp, Var1, Var2}, MustInvert} ->
-            process_catted(ParentDstByVarss, Var1, Var2, Dst, Node, CanonicalOp, MustInvert, Uses, Blocks, Acc0)
-    end.
+    CandidateTest = opt_test_traversals_is(Is, []),
+    % TODO VIB: consider making node does not exist instead of #{}
+    ParentInfoByVars = maps:get(Parent, DomTests, #{}),
+    opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, DomTests).
 
-process_catted(ParentDstByVarss, Var1, Var2, Dst, Node, CanonicalOp, MustInvert, Uses, Blocks, Acc0) ->
-    case ParentDstByVarss of 
-        #{{Var1, Var2} := {ParentDst, ParentL, ParentMustInvert, ParentCanonicalOp}} ->
-            DstByVars = #{{Var1, Var2} => {Dst, Node}},
-
-            {NodeVal, BlocksCool} = case {var_single_use(ParentDst, {uses, Uses}), var_single_use(Dst, {uses, Uses})} of
-                                        {true, true} -> 
-                                            % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
-                                            BlocksP = maps:update_with(ParentL, fun(V) -> change_parent(V, ParentMustInvert, ParentCanonicalOp, Var1, Var2) end, Blocks),
-                                            BlocksC = maps:update_with(Node, fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end, BlocksP),
-
-                                            % no need to update parent if child not matched func head
-                                            BlocksD = case BlocksC =/= BlocksP of
-                                                          true ->
-                                                              io:format("AAPPLIED~n"),
-                                                              BlocksC;
-                                                          false ->
-                                                              io:format("NNOTAPPLIED~n"),
-                                                              Blocks
-                                                      end,
-                                            {ParentDstByVarss, BlocksD}
-                                            ;
-                                        {true, false} -> {ParentDstByVarss, Blocks};
-                                        {false, true} -> {DstByVars, Blocks};
-                                        {false, false} -> {#{}, Blocks}
-                                    end,
-            {Acc0#{Node => NodeVal}, BlocksCool};
+opt_test_traversal(none, ParentInfoByVars, Node, _Uses, Blocks, DomTests) -> 
+    {DomTests#{Node => ParentInfoByVars}, Blocks};
+opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, Acc0) ->
+    {Dst, {CanonicalOp, Var1, Var2}, MustInvert} = CandidateTest,
+    Pack = fun(X, Y) -> {Acc0#{Node => X}, Y} end,
+    InfoByVars = #{{Var1, Var2} => #{dst => Dst, node => Node, mustinvert => MustInvert, op => CanonicalOp}},
+    case ParentInfoByVars of 
+        #{{Var1, Var2} := ParentInfo} ->
+            #{dst := ParentDst, node := ParentL} = ParentInfo,
+            ParentSingleUse = var_single_use(ParentDst, Uses),
+            SingleUse = var_single_use(Dst, Uses),
+            case {ParentSingleUse, SingleUse} of
+                % apply optimization
+                {true, true} -> 
+                    % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
+                    ChangeParent = fun(V) -> change_parent(V, ParentInfo, Var1, Var2) end,
+                    BlocksP = maps:update_with(ParentL, ChangeParent, Blocks),
+                    ChangeRetraversal = fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end,
+                    BlocksC = maps:update_with(Node, ChangeRetraversal, BlocksP),
+                    % no need to update parent if child not matched func head
+                    BlocksD = case BlocksC =/= BlocksP of
+                                  true ->
+                                      io:format("APPLIED~n"),
+                                      BlocksC;
+                                  false ->
+                                      io:format("NOTAPPLIED~n"),
+                                      Blocks
+                              end,
+                    % this parent might be a parent for yet another retraversal
+                    Pack(ParentInfoByVars, BlocksD);
+                % this parent might be a parent for another retraversal
+                {true, false} -> Pack(ParentInfoByVars, Blocks);
+                % this retraversal might be a parent for another retraversal
+                {false, true} -> Pack(InfoByVars, Blocks);
+                % neither parent nor retraversal can be optimized
+                {false, false} -> Pack(#{}, Blocks)
+            end;
         _ ->
-            DstByVars = #{{Var1, Var2} => {Dst, Node, MustInvert, CanonicalOp}},
-            % TODO VIB: maybe throw on merge
-            {Acc0#{Node => maps:merge(DstByVars, ParentDstByVarss)}, Blocks}
+            % TODO VIB: maybe throw on duplicate keys, should never happen
+            Pack(maps:merge(InfoByVars, ParentInfoByVars), Blocks)
     end.
 
-
-change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, MustInvert, CanonicalOp, Var1, Var2) ->
+change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, ParentInfo, Var1, Var2) ->
+    #{mustinvert := MustInvert, op := CanonicalOp} = ParentInfo,
     Blk1 = change_retrav(Blk0, BrVar, CanonicalOp, MustInvert),
     #b_blk{is=Is1} = Blk1,
-    % always the last ins since categorize_is2 only looks at the last ins
+    % always the last ins since opt_test_traversals_is only matches the last ins
     [I0 | Rest] = reverse(Is1),
     I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=erts_internal}, name=#b_literal{val=cmp_term}, arity=2}, Var1, Var2]},
     %I = I0#b_set{op=call,args=[#b_remote{mod=#b_literal{val=mycmp}, name=#b_literal{val=mycmp}, arity=2}, Var1, Var2]},
     Done = reverse(Rest, [I]),
     After = Blk1#b_blk{is=Done},
     After;
-change_parent(#b_blk{} = Blk0, _A, _B, _C, _D) ->
+change_parent(#b_blk{} = Blk0, _, _, _) ->
     % most common case (from diffable) is already changed, so b_switch
     Blk0.
 
@@ -1363,28 +1358,27 @@ change_retrav(#b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = B
     Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
     Blk0#b_blk{last=Sw};
 change_retrav(#b_blk{} = Blk0, _ParentVar, _CanonicalOp, _MustInvert) ->
-    % most common case (from diffable) is 
+    % a case (from diffable) that probably could be optimizaed is 
     % {b_ret,#{result_type => {t_atom,[false,true]}},{b_var,11}}}
     % TODO VIB: I can probably cover this case in the optimization (by replacing the prev b_set)
     Blk0.
 
  
-    % TODO VIB: does this just find the first test? Can't there be multiple tests?
-    % TODO VIB: I should return an index here so we can find which ins to modify. Actually maybe not since sometimes multiple insns in block need to modyfied
-    % TODO VIB: this only looks at the last b_set in the ins list, is that correct / good enough?
-categorize_is2([#b_set{op=Op,args=Args,dst=Dst}], _Acc) ->
+% TODO VIB: does this just find the first test? Can't there be multiple tests?
+% TODO VIB: this only looks at the last b_set in the ins list, is that correct / good enough?
+opt_test_traversals_is([#b_set{op=Op,args=Args,dst=Dst}], _Acc) ->
     case arith_test(Op, Args) of
         none ->
             none;
         {Test, MustInvert} ->
             {Dst, Test, MustInvert}
     end;
-categorize_is2([I|Is], Acc) ->
-    categorize_is2(Is, [I|Acc]);
-categorize_is2([], _Acc) -> none.
+opt_test_traversals_is([I|Is], Acc) ->
+   opt_test_traversals_is(Is, [I|Acc]);
+opt_test_traversals_is([], _Acc) -> none.
 
 
-var_single_use(Var, {uses, Uses}) when is_map(Uses) ->
+var_single_use(Var, Uses) ->
     case Uses of
         #{Var:=[_]} -> true;
         #{Var:=[_|_]} -> false
@@ -1395,8 +1389,6 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     Succ0 = case CanonicalOp of
         '<' -> [-1];
         '=<' -> [-1, 0];
-        % should never happen
-        %'=:=' -> [0];
         '==' -> [0]
     end,
     Fail0 = [-1,0,1] -- Succ0,
@@ -1409,7 +1401,6 @@ create_switch(Var, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert) wh
     SwTable = lists:merge(SuccTable, FailTable),
     beam_ssa:normalize(#b_switch{arg=Var,fail=FailLbl,list=SwTable}).
 
-
 arith_test(Op, Args) ->
     CanonicalTest = canonical_test(Op, Args),
     case CanonicalTest of
@@ -1420,7 +1411,6 @@ arith_test(Op, Args) ->
         %%% only tests with two vars are considered
         _ -> none
     end.
-
 
 opt_redundant_tests([L|Ls], Blocks, All0) ->
     case All0 of
