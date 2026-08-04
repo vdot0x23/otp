@@ -1278,7 +1278,7 @@ insert_dominator_node([Node | Rest], Tree) ->
     Tree#{Node => SubTree}.
 
 opt_test_traversals(DomTree, Blocks0, Uses) ->
-    {_, Blocks} = opt_test_traversals(DomTree, Uses, undefined, {#{}, Blocks0}),
+    {_, Blocks} = opt_test_traversals(DomTree, Uses, none, {#{}, Blocks0}),
     Blocks.
 opt_test_traversals(DomTree, Uses, Parent, State0) ->
     maps:fold(
@@ -1293,13 +1293,13 @@ opt_test_traversals_block(Node, Parent, Uses, {DomTests, Blocks}) ->
     Block = maps:get(Node, Blocks),
     #b_blk{is=Is} = Block,
     CandidateTest = opt_test_traversals_is(Is, []),
-    % TODO VIB: consider making node does not exist instead of #{}
+    % TODO VIB: consider making node not exist instead of #{}
     ParentInfoByVars = maps:get(Parent, DomTests, #{}),
     opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, DomTests).
 
 opt_test_traversal(none, ParentInfoByVars, Node, _Uses, Blocks, DomTests) -> 
     {DomTests#{Node => ParentInfoByVars}, Blocks};
-opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, Acc0) ->
+opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks0, Acc0) ->
     {Dst, {CanonicalOp, Var1, Var2}, MustInvert} = CandidateTest,
     Pack = fun(X, Y) -> {Acc0#{Node => X}, Y} end,
     InfoByVars = #{{Var1, Var2} => #{dst => Dst, node => Node, mustinvert => MustInvert, op => CanonicalOp}},
@@ -1312,36 +1312,42 @@ opt_test_traversal(CandidateTest, ParentInfoByVars, Node, Uses, Blocks, Acc0) ->
                 % apply optimization
                 {true, true} -> 
                     % TODO VIB: do I really need CanonicalOp and MustInvert stuff? Can't I just find it in change_parent instead of pass from here?
-                    ChangeParent = fun(V) -> change_parent(V, ParentInfo, Var1, Var2) end,
-                    BlocksP = maps:update_with(ParentL, ChangeParent, Blocks),
-                    ChangeRetraversal = fun(V) -> change_retrav(V, ParentDst, CanonicalOp, MustInvert) end,
-                    BlocksC = maps:update_with(Node, ChangeRetraversal, BlocksP),
-                    % no need to update parent if child not matched func head
-                    BlocksD = case BlocksC =/= BlocksP of
-                                  true ->
-                                      io:format("APPLIED~n"),
-                                      BlocksC;
-                                  false ->
-                                      io:format("NOTAPPLIED~n"),
-                                      Blocks
-                              end,
+                    Blocks = case Blocks0 of
+                                 #{Node := Block0} ->
+                                     case change_retraversal(Block0, ParentDst, CanonicalOp, MustInvert) of
+                                         {changed, Block} ->
+                                             io:format("APPLYING~n"),
+                                             Blocks1 = Blocks0#{Node := Block},
+                                             maps:update_with(
+                                               ParentL,
+                                               fun(V) ->
+                                                       change_parent(V, ParentInfo, Var1, Var2)
+                                               end,
+                                               Blocks1);
+                                         {unchanged, _} ->
+                                             % no need to update parent if retraversal not updated
+                                             io:format("NOTAPPLYING~n"),
+                                             Blocks0
+                                     end
+                             end,
                     % this parent might be a parent for yet another retraversal
-                    Pack(ParentInfoByVars, BlocksD);
+                    Pack(ParentInfoByVars, Blocks);
                 % this parent might be a parent for another retraversal
-                {true, false} -> Pack(ParentInfoByVars, Blocks);
+                {true, false} -> Pack(ParentInfoByVars, Blocks0);
                 % this retraversal might be a parent for another retraversal
-                {false, true} -> Pack(InfoByVars, Blocks);
+                {false, true} -> Pack(InfoByVars, Blocks0);
                 % neither parent nor retraversal can be optimized
-                {false, false} -> Pack(#{}, Blocks)
+                {false, false} -> Pack(#{}, Blocks0)
             end;
         _ ->
             % TODO VIB: maybe throw on duplicate keys, should never happen
-            Pack(maps:merge(InfoByVars, ParentInfoByVars), Blocks)
+            Pack(maps:merge(InfoByVars, ParentInfoByVars), Blocks0)
     end.
 
 change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = Blk0, ParentInfo, Var1, Var2) ->
     #{mustinvert := MustInvert, op := CanonicalOp} = ParentInfo,
-    Blk1 = change_retrav(Blk0, BrVar, CanonicalOp, MustInvert),
+    % TODO VIB: revisit whether changed/unchanged should matter here
+    {_, Blk1} = change_retraversal(Blk0, BrVar, CanonicalOp, MustInvert),
     #b_blk{is=Is1} = Blk1,
     % always the last ins since opt_test_traversals_is only matches the last ins
     [I0 | Rest] = reverse(Is1),
@@ -1351,17 +1357,17 @@ change_parent(#b_blk{last=#b_br{bool=BrVar,succ=_SuccLbl,fail=_FailLbl}=_Br0} = 
     After = Blk1#b_blk{is=Done},
     After;
 change_parent(#b_blk{} = Blk0, _, _, _) ->
-    % most common case (from diffable) is already changed, so b_switch
+    % most common case (from diffable) is an already changed parent, so b_switch
     Blk0.
 
-change_retrav(#b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0, ParentVar, CanonicalOp, MustInvert) ->
+change_retraversal(#b_blk{last=#b_br{bool=_BrVar,succ=SuccLbl,fail=FailLbl}=_Br0} = Blk0, ParentVar, CanonicalOp, MustInvert) ->
     Sw = create_switch(ParentVar, CanonicalOp, {succ, SuccLbl}, {fail, FailLbl}, MustInvert),
-    Blk0#b_blk{last=Sw};
-change_retrav(#b_blk{} = Blk0, _ParentVar, _CanonicalOp, _MustInvert) ->
+    {changed, Blk0#b_blk{last=Sw}};
+change_retraversal(#b_blk{} = Blk0, _ParentVar, _CanonicalOp, _MustInvert) ->
     % a case (from diffable) that probably could be optimizaed is 
     % {b_ret,#{result_type => {t_atom,[false,true]}},{b_var,11}}}
     % TODO VIB: I can probably cover this case in the optimization (by replacing the prev b_set)
-    Blk0.
+    {unchanged, Blk0}.
 
  
 % TODO VIB: does this just find the first test? Can't there be multiple tests?

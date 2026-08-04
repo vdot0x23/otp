@@ -459,7 +459,6 @@ join_arg_types(Args, TypeMaps) ->
 %%
 
 opt_function(Linear, Args, Id, Ts, FuncDb) ->
-    io:format("~nopt_function Linear: ~n~p~n", [Linear]),
     MetaCache = #{},
     opt_function(Linear, Args, Id, Ts, FuncDb, MetaCache).
 
@@ -2522,7 +2521,6 @@ concrete_types(Values, Ts) ->
 concrete_type(#b_literal{val=Value}, _Ts) ->
     beam_types:make_type_from_value(Value);
 concrete_type(#b_var{}=Var, Ts) ->
-    io:format("concrete_type Var: ~p~n", [Var]),
     #{ Var := Type } = Ts,
     case is_function(Type) of
         true -> Type(Ts);

@@ -97,34 +97,6 @@ An example of a typical ordering function is less than or equal to: `=</2`.
 -export([rkeymerge/3, rmerge/2, rmerge/3, rmerge3/3,
          rukeymerge/3, rumerge/2, rumerge/3, rumerge3/3]).
 
-
--export([mycmp/2]).
-
--spec mycmp(A,B) -> Result when
-    A :: term(),
-    B :: term(),
-    Result :: -1 | 0 | 1.
-
-mycmp(A, B) ->
-    % Prevent this from being optimized
-    % by making it depend on a side-effect like rand
-    % (which I know never matters, but the compiler does not)
-    RandA = rand:uniform(1),
-    A2 = if
-        RandA < 100 -> A;
-        true -> erlang:error("unreachable A")
-    end,
-    RandB = rand:uniform(1),
-    B2 = if
-        RandB < 100 -> B;
-        true -> erlang:error("unreachable B")
-    end,
-    if
-        A2 < B -> -1;
-        A2 == B2 -> 0;
-        A > B2 -> 1
-    end.
-
 %% Shadowed by erl_bif_types: lists:keyfind/3
 -doc """
 Searches the list of tuples `TupleList` for a tuple whose `N`th element compares

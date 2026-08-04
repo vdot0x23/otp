@@ -1,5 +1,5 @@
 -module(mycmp).
-% we need this, so probably we need to generate code to call mycmp:mycmp instead of lists:mycmp, because we want lists to be optimized
+% avoid generating code that forever call itself
 -compile([no_ssa_opt]).
 
 -export([mycmp/2]).
